@@ -39,21 +39,33 @@ is_windows() {
   esac
 }
 
-# json_get <json> <key>，key 支持 "db.driver" 这种一层嵌套
+# json_get <json> <key>，key 支持 "db.driver" 这种一层嵌套。
+#
+# 管理面所有响应都套着 {success, message, data} 信封（见 internal/controller/response.go），
+# 所以要读的键都在 data 里。这里统一先剥信封：调用方一律按 data 内的路径写
+# （如 db.driver），不必到处记得加前缀——少一处前缀就是一条假的 FAIL。
 json_get() {
   local json="$1" key="$2"
   if command -v jq >/dev/null 2>&1; then
     printf '%s' "$json" | jq -r --arg k "$key" '
-      ($k | split(".")) as $p
-      | if ($p | length) == 1 then .[$p[0]] else .[$p[0]][$p[1]] end
-      | tostring' 2>/dev/null
+      # 刻意不用 // 运算符：jq 把 false 当作"空"，而 redis_configured / ok
+      # 的合法值正是 false，用 // 会把它们误判成"没有 data"。
+      (if (.data? | type) == "object" then .data else . end) as $root
+      | ($k | split(".")) as $p
+      | (if ($p | length) == 1 then $root[$p[0]] else $root[$p[0]][$p[1]] end)
+      | if . == null then "" else tostring end' 2>/dev/null
     return
   fi
-  # 没有 jq 时退化为取第一个同名键——本脚本只用它读顶层与 db/cache 一层嵌套，
-  # 而 JSON 里这些键名在各自段内唯一。失败时脚本会打印完整 JSON 供人工核对。
+  # 没有 jq 时退化为按叶子键名取第一处出现。
+  # 刻意用 grep -o 而不是 sed：sed 的 .* 是贪婪的，会命中最后一个同名键
+  # （driver 在 db 与 log_db 里各有一个），取到的是邻段的值。
+  # 本脚本读的键都按 db/cache 段的顺序出现，且值都是简单标量，所以结果与 jq 路径一致。
+  # 失败时脚本会打印完整 JSON 供人工核对。
   printf '%s' "$json" | tr -d '\n' \
-    | sed -n "s/.*\"${key##*.}\"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p" \
-    | tr -d '"' | head -1
+    | grep -o "\"${key##*.}\"[[:space:]]*:[[:space:]]*[^,}]*" \
+    | head -1 \
+    | sed 's/^[^:]*:[[:space:]]*//' \
+    | tr -d '"'
 }
 
 # wait_status <port> <timeout_seconds>，成功则把 body 打到 stdout
