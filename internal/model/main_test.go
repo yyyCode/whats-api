@@ -37,6 +37,7 @@ func restoreEnvGlobals(t *testing.T) {
 func withTestDB(t *testing.T) {
 	t.Helper()
 	restoreEnvGlobals(t)
+	resetSystemSetting(t)
 
 	dir := t.TempDir()
 	t.Setenv("SQL_DSN", "local:"+filepath.Join(dir, "test.db"))
