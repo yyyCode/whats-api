@@ -120,6 +120,41 @@ func TestQuotaRoundCheckedNegativeUnderflows(t *testing.T) {
 	}
 }
 
+// -0.4 取整后是 -0，而 -0 < 0 为假：负数必须在取整前认出，
+// 否则 Round 档与 Float 档对同一个负数会给出相反结论。
+func TestQuotaRoundAgreesWithFloatFamilyOnNegativeFractions(t *testing.T) {
+	for _, f := range []float64{-0.4, -0.4999, -0.0001} {
+		wantV, wantClamp := QuotaFromFloatChecked(f)
+		gotV, gotClamp := QuotaRoundChecked(f)
+		if gotV != wantV || gotClamp != wantClamp {
+			t.Errorf("QuotaRoundChecked(%v) = (%d, %v)，而 QuotaFromFloatChecked(%v) = (%d, %v)",
+				f, gotV, gotClamp, f, wantV, wantClamp)
+		}
+		if _, err := QuotaRoundStrict(f); !errors.Is(err, ErrQuotaNegative) {
+			t.Errorf("QuotaRoundStrict(%v) 应报 ErrQuotaNegative，得到 %v", f, err)
+		}
+	}
+
+	// 精确的 0 与 -0 都不是负数，不该被当成下溢。
+	for _, f := range []float64{0, math.Copysign(0, -1)} {
+		if v, clamp := QuotaRoundChecked(f); v != 0 || clamp != ClampNone {
+			t.Errorf("QuotaRoundChecked(%v) = (%d, %v)，期望 (0, ClampNone)", f, v, clamp)
+		}
+	}
+}
+
+// decimal 档与浮点档对负数的判定也必须一致。
+func TestDecimalAgreesWithFloatFamilyOnNegativeFractions(t *testing.T) {
+	for _, s := range []string{"-0.4", "-0.0001"} {
+		if got, clamp := QuotaFromDecimalChecked(s); got != 0 || clamp != ClampUnderflow {
+			t.Errorf("QuotaFromDecimalChecked(%q) = (%d, %v)，期望 (0, ClampUnderflow)", s, got, clamp)
+		}
+	}
+	if got, clamp := QuotaFromDecimalChecked("-0"); got != 0 || clamp != ClampNone {
+		t.Errorf("QuotaFromDecimalChecked(\"-0\") = (%d, %v)，期望 (0, ClampNone)", got, clamp)
+	}
+}
+
 func TestQuotaFromDecimal(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -133,6 +168,8 @@ func TestQuotaFromDecimal(t *testing.T) {
 		{"零", "0", 0, ClampNone},
 		{"负数", "-1", 0, ClampUnderflow},
 		{"超过上限", "99999999999999999999", MaxQuota, ClampOverflow},
+		{"负数（取整后为 0）", "-0.4", 0, ClampUnderflow},
+		{"负零", "-0", 0, ClampNone},
 		{"非数字", "abc", 0, ClampNaN},
 		{"空串", "", 0, ClampNaN},
 		{"前后空白", "  12.6  ", 13, ClampNone},

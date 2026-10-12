@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -11,16 +12,33 @@ import (
 	"github.com/yyyCode/whats-api/internal/logger"
 )
 
-// ErrRedisDisabled 表示 Redis 未启用（未配置，或配置了但连不上）。
+// ErrRedisDisabled 表示 Redis 未启用（没配置，或启动期就没连上）。
 // 调用方据此走进程内缓存——这正是"拿掉 Redis 也能启动"的实现方式。
+//
+// 注意它**不**覆盖「启动时正常、运行中掉线」：那种情况下 RedisGet/RedisIncr
+// 返回的是 redis 驱动的原始错误（连接失败等），不是这个哨兵。需要在运行期
+// 降级的调用方（如 cachex.Counter）应当对任何 error 都回退，而不是只认哨兵。
 var ErrRedisDisabled = errors.New("redis 未启用")
 
+// 句柄写成 atomic：可用性在每个请求上都被读到，而 Init/Close 是写方。
+// 万一将来加入运行期重连，普通变量的并发读写就是数据竞争（-race 会报），
+// 不是"读到旧值"这么轻。LoadRedis 一次 Load 同时判定可用性与取句柄，
+// 分两次读可能跨越一次重连，拿到"已判定可用但句柄已换"的错配。
 var (
-	// RedisEnabled 为 true 时 RDB 可用。所有使用方都必须先看这个标志。
-	RedisEnabled bool
-	// RDB 在未启用时为 nil。
-	RDB *redis.Client
+	redisEnabled atomic.Bool
+	rdb          atomic.Pointer[redis.Client]
 )
+
+// LoadRedis 返回当前客户端；未启用时返回 nil。
+func LoadRedis() *redis.Client {
+	if !redisEnabled.Load() {
+		return nil
+	}
+	return rdb.Load()
+}
+
+// RedisEnabled 报告是否有可用的客户端。
+func RedisEnabled() bool { return LoadRedis() != nil }
 
 // InitRedisClient 初始化 Redis。**非致命**：
 //
@@ -29,10 +47,11 @@ var (
 //
 // 两种失败都不阻断启动：缓存是加速手段，不该成为可用性的单点。
 func InitRedisClient() {
-	RedisEnabled = false
-	if RDB != nil {
-		_ = RDB.Close()
-		RDB = nil
+	// 先摘掉旧句柄再探测：探测期间 LoadRedis 返回 nil，调用方走进程内缓存，
+	// 不会拿到一个马上要被关掉的客户端。
+	redisEnabled.Store(false)
+	if old := rdb.Swap(nil); old != nil {
+		_ = old.Close()
 	}
 
 	if RedisConnString == "" {
@@ -56,8 +75,8 @@ func InitRedisClient() {
 		return
 	}
 
-	RDB = client
-	RedisEnabled = true
+	rdb.Store(client)
+	redisEnabled.Store(true)
 	logger.Info("Redis 已启用")
 }
 
@@ -75,43 +94,52 @@ func normalizeRedisURL(s string) string {
 // 这样"多节点最终一致"的窗口只有一个概念，而不是两个不同的时间常数。
 func RedisKeyCacheSeconds() int { return SyncFrequency }
 
+// CloseRedis 关闭客户端并清空句柄：关闭后 RedisEnabled() 返回 false，
+// 后续调用拿到的是 ErrRedisDisabled，而不是"client is closed"这种
+// 没法用 errors.Is 识别的驱动错误。
 func CloseRedis() error {
-	if RDB == nil {
+	redisEnabled.Store(false)
+	old := rdb.Swap(nil)
+	if old == nil {
 		return nil
 	}
-	return RDB.Close()
+	return old.Close()
 }
 
 func RedisGet(key string) (string, error) {
-	if !RedisEnabled || RDB == nil {
+	client := LoadRedis()
+	if client == nil {
 		return "", ErrRedisDisabled
 	}
-	return RDB.Get(context.Background(), key).Result()
+	return client.Get(context.Background(), key).Result()
 }
 
 // RedisSet 写入键值并设 TTL。ttl <= 0 表示不过期。
 func RedisSet(key, value string, ttl time.Duration) error {
-	if !RedisEnabled || RDB == nil {
+	client := LoadRedis()
+	if client == nil {
 		return ErrRedisDisabled
 	}
-	return RDB.Set(context.Background(), key, value, ttl).Err()
+	return client.Set(context.Background(), key, value, ttl).Err()
 }
 
 func RedisDel(key string) error {
-	if !RedisEnabled || RDB == nil {
+	client := LoadRedis()
+	if client == nil {
 		return ErrRedisDisabled
 	}
-	return RDB.Del(context.Background(), key).Err()
+	return client.Del(context.Background(), key).Err()
 }
 
 // RedisIncr 原子自增，并刷新 TTL（滑动窗口）。
 // 走 pipeline 是为了让 INCR 与 EXPIRE 一次往返完成，避免"自增了但没设过期"的中间态。
 func RedisIncr(key string, ttl time.Duration) (int64, error) {
-	if !RedisEnabled || RDB == nil {
+	client := LoadRedis()
+	if client == nil {
 		return 0, ErrRedisDisabled
 	}
 	ctx := context.Background()
-	pipe := RDB.TxPipeline()
+	pipe := client.TxPipeline()
 	incr := pipe.Incr(ctx, key)
 	if ttl > 0 {
 		pipe.Expire(ctx, key, ttl)

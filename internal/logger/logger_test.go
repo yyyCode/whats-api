@@ -56,3 +56,26 @@ func TestLoggerBeforeSetupDoesNotPanic(t *testing.T) {
 		t.Fatal("Logger() 不应返回 nil")
 	}
 }
+
+// 钉住调用顺序契约：SetupLogger 会用 LOG_LEVEL 覆盖此前 SetLevel 设的值。
+//
+// 启动流程若把"读配置"放在 SetupLogger 之前，配置里的 log_level 就会被
+// 静默吃掉，现象是"改了日志级别没反应"而日志里毫无线索。这条测试让
+// 覆盖语义一旦变化就地报警，也说明为什么顺序不能反。
+func TestSetupLoggerOverridesEarlierSetLevel(t *testing.T) {
+	SetLevel(slog.LevelDebug)  // 假装配置域先跑了一步
+	SetupLogger("info", false) // 启动流程随后才建 logger
+
+	if Logger().Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("SetupLogger 应覆盖此前 SetLevel 设的级别（这正是顺序不能反的原因）")
+	}
+	if !Logger().Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("SetupLogger 之后应按 LOG_LEVEL 生效")
+	}
+
+	// SetupLogger 之后再 SetLevel，才是唯一有效的用法。
+	SetLevel(slog.LevelDebug)
+	if !Logger().Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("SetupLogger 之后的 SetLevel 应生效")
+	}
+}

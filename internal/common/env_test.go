@@ -1,6 +1,7 @@
 package common
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -113,6 +114,7 @@ func TestInitEnvClampsSyncFrequencyAndWarns(t *testing.T) {
 func TestInitEnvDoesNotWarnAtExactMinimum(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("SYNC_FREQUENCY", "5")
+	t.Setenv("SHUTDOWN_TIMEOUT_SECONDS", "5")
 	InitEnv()
 
 	if SyncFrequency != MinSyncFrequencySeconds || len(EnvWarnings) != 0 {
@@ -120,13 +122,160 @@ func TestInitEnvDoesNotWarnAtExactMinimum(t *testing.T) {
 	}
 }
 
+// 优雅退出的超时会被当成 deadline 用，0 或负数等于"立刻取消"，
+// 等于把优雅退出变成强杀；太大则让容器停不下来。下限必须被抬回来。
+func TestInitEnvClampsShutdownTimeout(t *testing.T) {
+	for _, in := range []string{"0", "-1"} {
+		t.Run(in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("SHUTDOWN_TIMEOUT_SECONDS", in)
+			InitEnv()
+
+			if ShutdownTimeout != MinShutdownTimeoutSeconds {
+				t.Errorf("SHUTDOWN_TIMEOUT_SECONDS=%s 应被抬到下限 %d，得到 %d",
+					in, MinShutdownTimeoutSeconds, ShutdownTimeout)
+			}
+			if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], "SHUTDOWN_TIMEOUT_SECONDS") {
+				t.Errorf("应产生一条 SHUTDOWN_TIMEOUT_SECONDS 告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+}
+
+// 端口超出 1-65535 是配置错误：回退默认值并告警，而不是把 0 端口交给监听。
+func TestInitEnvRejectsOutOfRangePort(t *testing.T) {
+	for _, in := range []string{"0", "-1", "65536", "99999"} {
+		t.Run(in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("PORT", in)
+			InitEnv()
+
+			if Port != DefaultPort {
+				t.Errorf("PORT=%s 应回退 %d，得到 %d", in, DefaultPort, Port)
+			}
+			if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], "PORT") {
+				t.Errorf("应产生一条 PORT 告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+
+	// 边界值合法，不该被误伤。
+	for _, in := range []string{"1", "65535"} {
+		t.Run("边界 "+in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("PORT", in)
+			InitEnv()
+
+			if port, _ := strconv.Atoi(in); Port != port {
+				t.Errorf("PORT=%s 是合法端口，不该被改，得到 %d", in, Port)
+			}
+			if len(EnvWarnings) != 0 {
+				t.Errorf("合法端口不该告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+}
+
+// 大小写不该决定主从：NODE_TYPE=Slave 若按原样比较，从节点会被判成主节点，
+// 从而去跑迁移——这是"多节点同时建表"最直接的来源。
+func TestInitEnvNodeTypeIsCaseInsensitive(t *testing.T) {
+	cases := []struct {
+		in         string
+		wantMaster bool
+	}{
+		{"master", true},
+		{"MASTER", true},
+		{"Master", true},
+		{"slave", false},
+		{"SLAVE", false},
+		{"Slave", false},
+		{"  slave  ", false}, // envStr 会去空白
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("NODE_TYPE", c.in)
+			InitEnv()
+
+			if IsMasterNode != c.wantMaster {
+				t.Errorf("NODE_TYPE=%q 时 IsMasterNode = %v，期望 %v", c.in, IsMasterNode, c.wantMaster)
+			}
+			if len(EnvWarnings) != 0 {
+				t.Errorf("大小写差异不该告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+}
+
+// 认不出来的取值按默认处理，但必须告警——否则运维写错一个词，
+// 主从角色就静默变了，而日志里什么都没有。
+func TestInitEnvWarnsOnUnknownNodeType(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("NODE_TYPE", "primary")
+	InitEnv()
+
+	if NodeType != DefaultNodeType || !IsMasterNode {
+		t.Errorf("NODE_TYPE=primary 应按默认 %q 处理，得到 %q", DefaultNodeType, NodeType)
+	}
+	if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], "NODE_TYPE") {
+		t.Errorf("应产生一条 NODE_TYPE 告警，得到 %v", EnvWarnings)
+	}
+}
+
+// CORS_ALLOW_ORIGINS 配了但一个有效条目都没有（如 ","）：必须按"谁都不允许"
+// 处理并告警，绝不能回落到默认值 "*"——那是允许所有来源，
+// 会把一次本想收紧的配置变成完全放开。
+func TestInitEnvTreatsEmptyCORSListAsDenyAll(t *testing.T) {
+	for _, in := range []string{",", " , ", ",,"} {
+		t.Run(in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("CORS_ALLOW_ORIGINS", in)
+			InitEnv()
+
+			if len(CORSAllowOrigins) != 0 {
+				t.Errorf("CORS_ALLOW_ORIGINS=%q 应得到空列表，得到 %v", in, CORSAllowOrigins)
+			}
+			for _, o := range CORSAllowOrigins {
+				if o == "*" {
+					t.Fatalf("CORS_ALLOW_ORIGINS=%q 回落到通配符 %q，等于完全放开", in, o)
+				}
+			}
+			if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], "CORS_ALLOW_ORIGINS") {
+				t.Errorf("应产生一条 CORS_ALLOW_ORIGINS 告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+}
+
 // 非法数值不致命：回退默认值继续启动，而不是启动不了。
+// 但回退必须留痕——否则 PORT=abc 会安安静静跑在默认端口上，
+// 而运维以为服务听在他们配的端口上。
 func TestInitEnvFallsBackOnInvalidNumbers(t *testing.T) {
+	cases := []struct {
+		key string
+		val string
+	}{
+		{"PORT", "not-a-port"},
+		{"PORT", "3000.5"},
+		{"SHUTDOWN_TIMEOUT_SECONDS", "abc"},
+		{"SYNC_FREQUENCY", "60秒"},
+	}
+	for _, c := range cases {
+		t.Run(c.key+"="+c.val, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(c.key, c.val)
+			InitEnv()
+
+			if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], c.key) {
+				t.Errorf("%s=%q 回退默认值时应留下一条告警，得到 %v", c.key, c.val, EnvWarnings)
+			}
+		})
+	}
+
 	clearEnv(t)
 	t.Setenv("PORT", "not-a-port")
 	t.Setenv("SHUTDOWN_TIMEOUT_SECONDS", "abc")
 	InitEnv()
-
 	if Port != DefaultPort {
 		t.Errorf("非法 PORT 应回退 %d，得到 %d", DefaultPort, Port)
 	}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -257,6 +258,32 @@ func TestRegisterPanicsOnMisuse(t *testing.T) {
 		{"OnRebuild 注册到不存在的模块", func() {
 			NewManager().OnRebuild("nope", func() {})
 		}},
+		// 模块名或 tag 里出现 '.'：key 用第一个点切分，带点的名字会让不同模块
+		// 撞进同一个 key。这种情况必须在注册期就拦下。
+		{"模块名含点", func() {
+			s := newTestSetting()
+			NewManager().Register("a.b", &s)
+		}},
+		{"json tag 含点", func() {
+			s := struct {
+				Level string `json:"a.b"`
+			}{}
+			NewManager().Register("x", &s)
+		}},
+		// NaN/±Inf 编不出 JSON：MustMarshalString 会返回空串，于是 Option 表的
+		// 默认值里出现一个不是 JSON 的 ""，等别处解析才报错。
+		{"浮点默认值是 NaN", func() {
+			s := struct {
+				F float64 `json:"f"`
+			}{F: math.NaN()}
+			NewManager().Register("x", &s)
+		}},
+		{"浮点默认值是正无穷", func() {
+			s := struct {
+				F float64 `json:"f"`
+			}{F: math.Inf(1)}
+			NewManager().Register("x", &s)
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -268,6 +295,53 @@ func TestRegisterPanicsOnMisuse(t *testing.T) {
 			c.fn()
 		})
 	}
+}
+
+// json:"-" 是 Go 里"明确排除该字段"的写法，不是漏写 tag：它是合法意图，
+// 不该 panic，也不该出现在配置项里。
+func TestRegisterSkipsExplicitlyExcludedFields(t *testing.T) {
+	m := NewManager()
+	s := struct {
+		Level  string `json:"level"`
+		Secret string `json:"-"`
+		hidden string // 未导出字段同样不参与配置
+	}{Level: "info", Secret: "s3cr3t"}
+
+	m.Register("mod", &s)
+
+	got := m.ExportAllConfigs()
+	if _, ok := got["mod.secret"]; ok {
+		t.Error(`json:"-" 的字段不该出现在配置里`)
+	}
+	if got["mod.level"] != `"info"` {
+		t.Errorf(`ExportAllConfigs()["mod.level"] = %q，期望 "info"`, got["mod.level"])
+	}
+	if n := m.FieldCount(); n != 1 {
+		t.Errorf("FieldCount() = %d，期望 1", n)
+	}
+}
+
+// 匿名结构体的 reflect.Type.Name() 是空串。报错信息里不能出现「字段 .B」
+// 这种指不出是哪个模块的写法——注册期 panic 是给人看的，得能定位。
+func TestRegisterErrorNamesAnonymousStructReadably(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("应该 panic")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("panic 值应为 string，得到 %T", r)
+		}
+		if strings.Contains(msg, "字段 .") {
+			t.Errorf("报错信息里没有结构体名，定位不到模块：%s", msg)
+		}
+		if !strings.Contains(msg, "Level") {
+			t.Errorf("报错信息应指出是哪个字段：%s", msg)
+		}
+	}()
+	s := struct{ Level string }{}
+	NewManager().Register("x", &s)
 }
 
 // 多个模块各自的 key 不能互相污染。

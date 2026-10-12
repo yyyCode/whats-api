@@ -73,6 +73,13 @@ var (
 //	+Inf / > MaxQuota → MaxQuota + ClampOverflow
 //	-Inf / < 0        → 0        + ClampUnderflow
 //
+// 负号要在取整**之前**判断：math.Round(-0.4) 是 -0，而 Go 里 -0 < 0 为假，
+// 先取整会把"负数金额"当成正常值。三档（Float/Round/Decimal）对同一输入
+// 的判定必须一致，否则调用方换个入口就得到相反的结论。
+//
+// 另注：指数超出 decimal 解码上限的字符串（如 "1e1000000000"）在 decimal 档
+// 报 ClampNaN 而不是 ClampOverflow——值从未被成功解析出来，无从与上限比较。
+//
 // 为什么 NaN 不饱和到 MaxQuota：结算路径上那会给出荒谬的巨额扣费。
 // 饱和到 0 是"宁可少扣"，但正因为危险，所以必须返回标记让调用方显式处理
 // ——零 usage 绝不能当成免费。
@@ -125,16 +132,28 @@ func QuotaFromFloatStrict(f float64) (int, error) {
 // 分层计费必须用它：如果先算小数再截断，预扣与结算会差 ±1 quota，
 // 日志里天天出现"金额对不上"的噪声。
 func QuotaRound(f float64) int {
-	v, _ := clampQuota(math.Round(f))
+	v, _ := QuotaRoundChecked(f)
 	return v
 }
 
+// QuotaRoundChecked 与 QuotaFromFloatChecked 对同一输入的判定必须一致，
+// 所以先判符号再取整（-0.4 取整成 -0 会丢掉符号，详见 clampQuota 的说明）。
 func QuotaRoundChecked(f float64) (int, QuotaClamp) {
+	if math.IsNaN(f) {
+		return 0, ClampNaN
+	}
+	if f < 0 {
+		return 0, ClampUnderflow
+	}
 	return clampQuota(math.Round(f))
 }
 
 func QuotaRoundStrict(f float64) (int, error) {
-	return QuotaFromFloatStrict(math.Round(f))
+	v, clamp := QuotaRoundChecked(f)
+	if clamp.Saturated() {
+		return 0, clampError(clamp)
+	}
+	return v, nil
 }
 
 // QuotaFromDecimal 用 decimal 处理字符串价格，避免 "0.1" 这类值走 float 丢精度。
@@ -157,7 +176,11 @@ func QuotaFromDecimalChecked(s string) (int, QuotaClamp) {
 func QuotaFromDecimalStrict(s string) (int, error) {
 	d, err := decimal.NewFromString(strings.TrimSpace(s))
 	if err != nil {
-		return 0, fmt.Errorf("解析金额 %q 失败: %w", s, err)
+		// 包上 ErrQuotaNaN：Checked 档对同一输入给 ClampNaN、浮点 Strict 档给
+		// ErrQuotaNaN，唯独 strict 这一档拿不到统一的哨兵，调用方就没法用
+		// errors.Is 识别"这不是一个有效金额"。
+		// shopspring 没有导出解析错误变量，只能把原始错误以文本形式附上。
+		return 0, fmt.Errorf("%w：无法解析金额 %q（%v）", ErrQuotaNaN, s, err)
 	}
 	v, clamp := decimalToQuota(d)
 	if clamp.Saturated() {
@@ -171,13 +194,12 @@ func QuotaFromDecimalStrict(s string) (int, error) {
 // 注意这里全程不经过 float64：几十位的价格字符串转 float 就丢精度了，
 // 越界判断会变得不可靠。
 func decimalToQuota(d decimal.Decimal) (int, QuotaClamp) {
-	if d.IsZero() {
-		return 0, ClampNone
-	}
-	rounded := d.Round(0) // shopspring 的 Round 是 half away from zero
-	if rounded.IsNegative() {
+	// 负号在取整前判：d.Round(0) 会把 -0.4 变成 0，之后 IsNegative() 就为假了，
+	// 于是同一个负数在 decimal 档变成 ClampNone、在浮点档却是 ClampUnderflow。
+	if d.IsNegative() {
 		return 0, ClampUnderflow
 	}
+	rounded := d.Round(0) // shopspring 的 Round 是 half away from zero
 	if rounded.GreaterThan(decimal.NewFromInt(MaxQuota)) {
 		return MaxQuota, ClampOverflow
 	}
