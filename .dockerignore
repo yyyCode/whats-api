@@ -1,0 +1,15 @@
+.git
+.gitignore
+whats-api
+whats-api.exe
+optctl.exe
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.env
+bin/
+dist/
+docs/
+*.md
+!README.md
