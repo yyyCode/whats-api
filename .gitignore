@@ -6,13 +6,16 @@
 *.db-wal
 
 # 构建产物
-bin/
-dist/
-whats-api
-whats-api.exe
-optctl
-optctl.exe
-whats-api-linux
+# ★ 必须带前导斜杠锚定到仓库根：不带斜杠的模式会匹配任意深度的同名文件**或目录**，
+# 于是 cmd/optctl/ 这种源码目录会被整体忽略——文件提交不上去，
+# 而且之后改动连 git status 都不显示。
+/bin/
+/dist/
+/whats-api
+/whats-api.exe
+/whats-api-linux
+/optctl
+/optctl.exe
 
 # 编辑器 / 系统
 .DS_Store
