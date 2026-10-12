@@ -76,10 +76,9 @@ whats-api/
     │   ├── quota_math.go         记账常量 + 数值安全函数族 + QuotaClamp
     │   └── redis.go              go-redis v8 封装 + 未配置时的退化标志
     ├── logger/logger.go          log/slog + 可热更新级别
-    ├── cachex/                   HybridCache[V]：Redis 与进程内自动切换
-    │   ├── cache.go  memory.go  redis.go
+    ├── cachex/counter.go         Counter：Redis 与进程内自动切换（M0 唯一的缓存原语，见 §6.1）
     ├── setting/
-    │   ├── config/config.go      ConfigManager：Register / ExportAllConfigs / UpdateConfig / OnRebuild
+    │   ├── config/config.go      ConfigManager：Register / ExportAllConfigs / UpdateConfig / ValidateConfig / OnRebuild
     │   └── system_setting/       第一个配置域（含原子快照 Get()）
     ├── model/
     │   ├── main.go               DB / LOG_DB、chooseDB、Migrate、migrateLOGDB、lockForUpdate、方言 helper
@@ -134,16 +133,16 @@ func Run(ctx context.Context) error {
     // 1  godotenv.Load(".env")        非致命：文件不存在只记 debug
     //    common.InitEnv()            环境变量 → 派生常量
     //    logger.SetupLogger()        初始级别取 LOG_LEVEL
-    // 2  model.InitDB()               ★致命：chooseDB → AutoMigrate（仅 master）→ 定向迁移
-    // 3  model.CheckSetup()           Setup 表首次安装标志
+    // 2  model.InitDB()               ★致命：chooseDB → AutoMigrate（仅 master）
+    // 3  model.CheckSetup()           Setup 表首次安装标志（仅 master 写入）
     // 4  model.InitOptionMap()        ★必须先于任何读配置的逻辑
-    // 5  model.InitLogDB()            LOG_SQL_DSN 为空则复用主库
+    // 5  model.InitLogDB()            LOG_SQL_DSN 为空则复用主库；显式配置却连不上 → 致命
     // 6  common.InitRedisClient()     非致命：失败降级内存缓存
-    // 7  cachex.Init()                依据 RedisEnabled 选后端
-    // 8  go model.SyncOptions(ctx, SYNC_FREQUENCY)
-    // 9  gin.New() → 全局中间件 → router.SetRouter(engine)
-    // 10 srv.ListenAndServe()（goroutine）
-    // 11 <-ctx.Done() → srv.Shutdown(SHUTDOWN_TIMEOUT) → 关 DB → 等后台 goroutine 退出
+    // 7  go model.SyncOptions(ctx, SYNC_FREQUENCY)
+    // 8  cachex.NewCounter(...)       M0 唯一的缓存原语（无 cachex.Init，见 §6.1）
+    // 9  gin.New() → 全局中间件 → router.SetRouter(engine) → srv.ListenAndServe()（goroutine）
+    // 10 <-ctx.Done() 或 ListenAndServe 返回错误
+    // 11 srv.Shutdown(SHUTDOWN_TIMEOUT) → wg.Wait() 等后台 goroutine → model.CloseDB() → CloseRedis()
 }
 ```
 
@@ -151,13 +150,29 @@ func Run(ctx context.Context) error {
 
 **为什么 `Run(ctx)` 独立成函数**：本机（Windows/Git Bash）无法向原生进程投递 SIGTERM，
 把停机路径做成可被测试直接取消 ctx 驱动，才能真实验证"在途请求跑完 + DB 关闭 + 后台 goroutine 退出"。
-信号处理只是 `Run(ctx)` 外面的一层薄壳。
+信号处理只是 `Run(ctx)` 外面的一层薄壳。为了让"在途请求跑完"这条**可观测**，
+`Run` 拆成 `Run(ctx)` 与 `RunWithOptions(ctx, Options{InjectRoutes func(*gin.Engine)})`——
+M0 没有任何慢到能观察到停机排水的生产端点，测试靠注入一个慢端点来验证。
+生产代码永远不传 `InjectRoutes`。
 
-**关键顺序约束（写进代码注释）**：
+**关键顺序约束（全部写进代码注释）**：
 
 1. `InitOptionMap()` 必须在任何读配置的模块之前——包括 `InitLogDB`（日志库 DSN 将来可配置）。
-2. `InitDB` 是唯一的致命初始化；其余（Redis、日志库、dotenv）失败都降级。
-3. 后台 goroutine 全部接收 `ctx`，`Run` 返回前用 `sync.WaitGroup` 等它们退出，避免停机期写已关闭的 DB。
+2. **停机顺序：先 `srv.Shutdown`（等在途请求），再 `wg.Wait()`（等后台 goroutine），最后 `CloseDB()`。**
+   顺序颠倒会让后台 goroutine 在停机期写到已关闭的连接上——
+   那类错误只在停机瞬间偶发，平时测得再多次也遇不到。
+3. **致命 vs 降级**：
+
+   | 初始化 | 失败后果 | 理由 |
+   |---|---|---|
+   | `InitDB` / 迁移 | **致命** | 主库连不上没有任何业务可谈 |
+   | `CheckSetup` | **致命** | setup 是安装标志，写不进去说明库不可用 |
+   | `InitOptionMap` | **致命** | 配置未装载时读到的默认值会静默覆盖管理员配置 |
+   | `InitLogDB`（显式配了 `LOG_SQL_DSN`） | **致命** | 账本是审计凭证；接不上就必须让人知道，而不是静默丢日志 |
+   | `InitLogDB`（复用主库） | 不可能失败 | 主库已在用 |
+   | `dotenv.Load` / `InitRedisClient` | **降级** | 本地没 `.env`、没 Redis 都是正常状态 |
+
+4. 后台 goroutine 全部接收 `ctx`，`Run` 返回前用 `sync.WaitGroup` 等它们退出。
 
 ---
 
@@ -200,6 +215,9 @@ func (m *Manager) ExportAllConfigs() map[string]string
 // UpdateConfig 按 json tag 定位字段并写回；未知 key / 类型不符 返回错误且不写入
 func (m *Manager) UpdateConfig(key, rawJSON string) error
 
+// ValidateConfig 只校验不写入：与 UpdateConfig 的接受集合完全一致（同走 setField）
+func (m *Manager) ValidateConfig(key, rawJSON string) error
+
 // OnRebuild 注册某域的"重建快照"回调；在 Manager 写锁内被调用，实现方负责原子发布
 func (m *Manager) OnRebuild(name string, hook func())
 
@@ -208,7 +226,24 @@ func (m *Manager) Modules() []string
 ```
 
 支持的字段类型（M0）：`string`、`bool`、`int`、`int64`、`float64`。
-其他类型在 `UpdateConfig` 中返回明确的 unsupported 错误；扩展点写在 `updateField` 一处。
+
+**不支持的字段类型在 `Register` 时就 panic，而不是留到 `UpdateConfig` 报错。**
+理由：`Register` 只在 `init()` 里被调用，那里出现一个注册不进去的字段是**编码错误**
+（写配置域的人以为这个字段可配置，实际永远改不了），必须在启动时就炸出来；
+放到 `UpdateConfig` 报错则意味着服务能正常跑、直到有人尝试改那一项才发现。
+fail-fast 的位置应该在"错误被引入的地方"，而不是"错误被发现的地方"。
+
+**`ValidateConfig` 为什么单独存在**：配置的写入路径是 `校验 → 落库 → 改内存`
+（见 §4.4）。校验必须先于落库——否则一个非法值会先落进库里，再被别的实例同步过去，
+一处错误变成处处错误。因此"校验"必须能独立于"写入"被调用。
+
+它把值解析进 `reflect.New(fv.Type()).Elem()` 这个**与真实字段同类型**的临时副本，
+再交给同一个 `setField`。类型相同保证了不存在"校验通过但写入失败"的裂缝：
+能装进副本的值，就一定能装进字段。
+
+`ValidateConfig` 持**读锁**、`UpdateConfig` 持**写锁**，两者的 key 解析共用
+`lookupLocked(key) (*module, field, error)`；写入动作留在各自调用方，
+避免出现"持读锁却写真实字段"的并发 bug。
 
 ### 4.3 原子快照（对文档草稿的一处加固）
 
@@ -262,23 +297,30 @@ func Get() *SystemSetting { return current.Load() }
 启动：InitOptionMap()
         ├─ config.GlobalConfig.ExportAllConfigs()   默认值（含所有域的初始快照）
         └─ loadOptionsFromDatabase()                DB 行覆盖默认值 → updateOptionMap(key, value)
+                                                    无法应用的脏行：WARN 并跳过（不阻断启动）
 
 改配置：UpdateOption(key, value)                     ★ 唯一写入路径
-        ├─ validateOptionValue(key, value)           未注册 key → 拒绝
-        ├─ saveOption(key, value)                    落库（失败则不改变内存）
+        ├─ config.GlobalConfig.ValidateConfig()      未注册 key / 类型不符 → 拒绝（此时还没落库）
+        ├─ saveOption(key, value)                    upsert 落库（失败则内存一个字节都不改）
         └─ updateOptionMap(key, value)
-              ├─ OptionMap[key] = value              内存 map（多节点同步用）
-              ├─ handleConfigUpdate(key, value)      反射写入注册结构体 + 触发 OnRebuild（原子发布快照）
+              ├─ config.GlobalConfig.UpdateConfig()  反射写入注册结构体 + 在写锁内 OnRebuild → 原子发布快照
+              ├─ OptionMap[key] = value              内存 map（同步比较基准）
               └─ applySideEffects(key)               非结构化副作用开关（M0：日志级别）
 
-热更新：SyncOptions(ctx, freq)                        定时从 DB 重载全部 Option 行 → updateOptionMap
+热更新：SyncOptions(ctx, freq)                        定时从 DB 重载全部 Option 行 → 只对变化项走 updateOptionMap
 ```
 
+- **顺序不可颠倒：校验 → 落库 → 改内存。** 先改内存再落库的话，落库失败会留下
+  "这个实例与库不一致"的状态，重启后表现为"配置莫名其妙回退了"，而且排查时看不到任何报错。
+- **校验必须在落库之前完成**，因为库里的脏值会被别的实例同步过去——一处错变成处处错。
+  这正是 §4.2 里 `ValidateConfig` 需要独立存在的原因：只有它能做到"确认可接受之后再落库"。
 - 内存 map 与运行时结构体**必须一起改**，且只有 `updateOptionMap` 一个分发点。
 - `applySideEffects` 是一个集中 switch（文档的"一个大 switch"）。M0 里**只有 `system_setting.log_level`
   需要副作用**（调 `logger.SetLevel`）；`status_message`、`enable_access_log`、
   `slow_request_threshold_seconds` 三个字段没有副作用，改完由 `middleware` 与 `/api/status` 直接读快照即可生效。
-- `validateOptionValue`：key 必须存在于注册表；值必须能解析成该字段类型。
+- `saveOption` 用 `clause.OnConflict{Columns: [{key}], DoUpdates: ["value"]}`，
+  让 GORM 按方言生成 `ON DUPLICATE KEY UPDATE`（MySQL）或 `ON CONFLICT DO UPDATE`（PG/SQLite）——
+  一份代码三库通用的 upsert。
 
 ### 4.5 SyncOptions 的多实例语义
 
@@ -296,7 +338,7 @@ func Get() *SystemSetting { return current.Load() }
 
 ```go
 // internal/model/main.go
-func chooseDB(envName string, isLog bool) (gorm.Dialector, dbKind, error)
+func chooseDB(dsn string, isLog bool) (gorm.Dialector, dbKind, error)
 ```
 
 | DSN | 驱动 | 备注 |
@@ -313,14 +355,20 @@ func chooseDB(envName string, isLog bool) (gorm.Dialector, dbKind, error)
 ### 5.2 方言 helper（一次到位，避免 M1/M2 回头改）
 
 ```go
-func commonKeyCol() string     // 保留字列 key 的引用写法：PG 用 "key"，MySQL/SQLite 用 `key`
-func commonTrueVal() string    // 按 dialect 返回 "1"/"0" 或 "true"/"false"
-func commonFalseVal() string
-func lockForUpdate(tx *gorm.DB) *gorm.DB  // MySQL/PG 发 FOR UPDATE；SQLite 原样返回
+// 名字以 For 结尾的是纯函数：传入方言名，返回该方言的字面量。
+// 后四个是不带 For 的薄包装，它们读当前活连接的方言。
+func keyColFor(dialect string) string      // 保留字列 key 的引用写法：PG 用 "key"，MySQL/SQLite 用 `key`
+func trueValFor(dialect string) string     // "1"/"0" 或 "true"/"false"
+func falseValFor(dialect string) string
+func lockForUpdateFor(dialect string, tx *gorm.DB) *gorm.DB  // MySQL/PG 加 FOR UPDATE；SQLite 原样返回
+
+func commonKeyCol() string
+func commonTrueVal() / commonFalseVal() string
+func lockForUpdate(tx *gorm.DB) *gorm.DB
 func isSQLite() / isPostgres() / isMySQL() bool
 ```
 
-**两处与文档的差异，都是为了不留死代码：**
+**三处与文档的差异，都是为了不留死代码或让方言分支可测：**
 
 1. **不实现 `commonGroupCol`。** 文档需要它是因为库里有字面名为 `group` 的保留字列。
    本项目按 `11-blueprint.md` §4 的 DDL 骨架，所有分组列统一命名 `group_name`
@@ -329,6 +377,10 @@ func isSQLite() / isPostgres() / isMySQL() bool
    再把 `commonGroupCol` 补上。
 2. **实现为函数而非变量。** 方言在 `InitDB` 之后才知道；若做成包级变量，
    在 `InitDB` 之前被读到就是空串——静默出错。函数取用没有这个初始化顺序耦合。
+3. **核心逻辑做成"传入方言名"的纯函数**（`*For(dialect, ...)`），不带 `For` 的版本只是
+   读活连接再转调。这样 PostgreSQL 与 MySQL 两个分支**在没有真实 PG/MySQL 实例的机器上也能测**：
+   断言 PG 下生成 `"key"` 与 `true`、且 `lockForUpdateFor` 确实挂上了 `FOR UPDATE` 子句。
+   否则这两条分支在 M0 只能靠"看起来对"。
 
 **M0 的现实**：这些 helper 在 M0 只有测试调用（M0 没有裸 SQL，GORM 自己会为标识符加引号）。
 它们的价值在于 M1/M2 写条件 UPDATE 与裸 SQL 时**不必回头改数据层约定**，
@@ -343,7 +395,6 @@ func isSQLite() / isPostgres() / isMySQL() bool
 func Migrate() error {
     if !common.IsMasterNode { logger.Info("非 master 节点，跳过迁移"); return nil }
     if err := DB.AutoMigrate(mainModels()...); err != nil { return err }
-    for _, m := range targetedMigrations { if err := m(DB); err != nil { return err } }
     return nil
 }
 
@@ -359,8 +410,11 @@ func migrateLOGDB() error {
 }
 ```
 
-- `targetedMigrations` 在 M0 为空切片，但**框架与调用点先建好**（M1/M2 会往里加）。
-- 幂等：七张表的建表与 `setup` 首次写入必须可重复执行；验收脚本连续启动三次。
+- **不预留 `targetedMigrations` 空切片。** 文档草稿里它是"AutoMigrate 管不到的手写 DDL"
+  （例如 SQLite 改列必须重建表）的挂载点，但 M0 的所有变更 AutoMigrate 都能表达，
+  留一个空注册表等于留一段只有测试会调用的死代码。等 M1/M2 真的需要手写 DDL 时再引入，
+  那时它有真实内容、也知道该长什么样。
+- 幂等：六张表 + 日志表的建表与 `setup` 首次写入必须可重复执行；验收脚本连续启动三次。
 - `logs` 走 `LOG_DB`，不进 `mainModels()`——这是 08 篇"日志库分离"的接缝，
   M0 就把 `logs` 放在日志库，等于**当下就验证了这条接缝是通的**（测试：`LOG_SQL_DSN` 指向另一个
   SQLite 文件时，`logs` 表出现在日志库而主库没有它）。
@@ -431,25 +485,49 @@ var (
     RDB          *redis.Client // 未启用时为 nil
 )
 func InitRedisClient()   // 非致命：连接失败 → RedisEnabled=false + WARN，继续启动
-func RedisGet / RedisSet / RedisDel / RedisIncr / RedisHSetObj / RedisHGetObj / RedisKeyCacheSeconds
+func NormalizeRedisURL(raw string) string
+func RedisGet / RedisSet / RedisDel / RedisIncr / RedisKeyCacheSeconds
+func CloseRedis() error
 ```
 
 ```go
-// internal/cachex
-type ValueCodec[V any] interface { Encode(V) string; Decode(string) (V, error) }
-type HybridCache[V any] struct { ... }
-func New[V any](namespace string, codec ValueCodec[V], ttl time.Duration) *HybridCache[V]
-func (c *HybridCache[V]) Get(key string) (V, bool)
-func (c *HybridCache[V]) Set(key string, v V)
-func (c *HybridCache[V]) Incr(key string) (int64, error)
-func (c *HybridCache[V]) Delete(key string)
+// internal/cachex — M0 只有一种原语：计数器
+type Counter struct { namespace string; ttl time.Duration }
+func NewCounter(namespace string, ttl time.Duration) *Counter
+func (c *Counter) Incr(key string) (int64, error)  // Redis: INCR + EXPIRE 走 pipeline
+func (c *Counter) Get(key string) (int64, bool)
+func (c *Counter) Backend() string                  // "redis" / "memory"
 ```
 
-- Redis 可用 → 走 Redis；不可用 → 进程内实现（`sync.Map` + 惰性过期）。
-- 两种后端的语义差异（TTL 精度、原子性）封在实现内部；`Incr` 在内存后端用 `atomic` 保证原子。
+- Redis 可用 → 走 Redis；不可用 → 进程内实现（`sync.Map` + 滑动 TTL）。
+- 两种后端的语义差异（TTL 精度、原子性）封在实现内部；`Incr` 在内存后端用
+  `sync.Mutex` + 计数器保证原子。Redis 路径运行期失败时**逐次降级到内存**，
+  而不是让一次 Redis 抖动升级成请求失败。
 - **M0 的真实用途**：`requests_total` 计数器（`/api/status` 暴露）。
   这样"拔掉 Redis 也能启动并继续工作"不是空话，是可断言的观察点。
 - 不使用 Redis 做配置同步（那是 `SyncOptions` 的 DB 轮询路径，M0 不引入 Redis 发布订阅）。
+
+### 6.1 相对文档草稿的缩减：`HybridCache[V]` 推迟
+
+文档草稿（08 篇 §5）的 `HybridCache[V]` + `ValueCodec[V]` 是通用缓存容器，
+配套 `RedisHSetObj` / `RedisHGetObj` 两个哈希对象读写函数。**M0 不实现它们。**
+
+理由：M0 既没有缓存对象要存，也没有第二个使用者。一个只有测试调用的泛型容器
+加编解码接口，是典型的"提前抽象"——它的接口形状是靠猜的，而猜错的抽象
+比没有抽象更贵（后面每个使用点都要绕过它或改它）。
+
+M0 真正需要的能力只有一件：**一个跨实例的计数器**，于是只做 `cachex.Counter`。
+它已经完整覆盖了这条验收标准要证的东西：
+
+- Redis 可用 → 计数在 Redis 里（多实例共享）；
+- Redis 不可用/配错/运行期挂掉 → 自动降级为进程内计数，服务照常启动与运行；
+- `/api/status` 的 `cache.backend` 与 `requests_total` 让这件事**可被观察**。
+
+`HybridCache[V]` / `ValueCodec[V]` / `RedisHSetObj` / `RedisHGetObj` 推迟到
+第一个真正需要缓存对象的里程碑（M1 的 token 鉴权缓存、M4 的渠道索引缓存），
+那时它们的接口形状由真实使用点决定。同一原则也适用于 §5.2 的
+`commonGroupCol`（M0 没有裸 SQL 用它）与 §5.3 的 `targetedMigrations`
+（M0 的变更 AutoMigrate 全能表达）：**空注册表不是接缝，是死代码。**
 
 ---
 
@@ -479,12 +557,22 @@ M0 把它做成全局中间件、按路径前缀推断标签——因为 M0 还�
 
 ```go
 // internal/router
-func SetRouter(engine *gin.Engine) {
-    setApiRouter(engine)     // /api  管理面
-    setRelayRouter(engine)   // /v1   转发面（仅骨架）
-    setWebRouter(engine)     // NoRoute 兜底
+type Deps struct {
+    Requests  *cachex.Counter // /api/status 的 requests_total
+    StartedAt time.Time       // uptime_seconds
+}
+
+func SetRouter(engine *gin.Engine, deps Deps) {
+    engine.Use(/* 六层全局中间件，顺序见 §7.1 */)
+
+    setAPIRouter(engine, deps)   // /api  管理面
+    setRelayRouter(engine)       // /v1   转发面（仅骨架，不注册端点）
+    setWebRouter(engine)         // NoRoute 兜底
 }
 ```
+
+进程级依赖（计数器、启动时间）由 `app.Run` 创建并显式传入，不经全局变量——
+与 §2 的"全局变量规则"一致：只有真单例句柄才允许做包级变量。
 
 - `/v1` 组在 M0 **只有分组与标记，不注册任何端点**（严格 M0 范围）。它存在的意义是把
   "两个面从一开始就分开"这条决策固化成代码形状，M1 直接往里加 handler。
@@ -569,23 +657,24 @@ func QuotaFromDecimalStrict(s string) (int, error)                  // 溢出/�
 
 ## 9. 依赖
 
-| 依赖 | 用途 | 版本约束 |
+| 依赖 | 用途 | 版本 |
 |---|---|---|
-| `github.com/gin-gonic/gin` | HTTP | v1.10.x（Go 1.23 兼容） |
-| `gorm.io/gorm` | ORM | v1.25.x |
-| `gorm.io/driver/mysql` / `driver/postgres` | MySQL / PostgreSQL | 与 gorm 主版本匹配 |
-| `github.com/glebarez/sqlite` | 纯 Go SQLite（免 CGO） | 需其 `modernc.org/sqlite` 依赖支持 Go 1.23 |
-| `github.com/go-redis/redis/v8` | Redis（文档指定 v8） | v8.11.x |
-| `github.com/shopspring/decimal` | `QuotaFromDecimal` | v1.4.x |
-| `github.com/joho/godotenv` | `.env` | v1.5.x |
+| `github.com/gin-gonic/gin` | HTTP | v1.12.0 |
+| `gorm.io/gorm` | ORM | v1.31.2 |
+| `gorm.io/driver/mysql` | MySQL | v1.6.0 |
+| `gorm.io/driver/postgres` | PostgreSQL | v1.6.3 |
+| `github.com/glebarez/sqlite` | 纯 Go SQLite（免 CGO） | v1.11.0（modernc.org/sqlite v1.23.1） |
+| `github.com/go-redis/redis/v8` | Redis（文档指定 v8） | v8.11.5 |
+| `github.com/shopspring/decimal` | `QuotaFromDecimal` | v1.5.0 |
+| `github.com/joho/godotenv` | `.env` | v1.5.1 |
 
 **不引入**：测试框架（用标准 `testing`）、日志库（用标准 `log/slog`）、内存 LRU 库（`cachex` 自己实现）、
 ClickHouse 驱动。ClickHouse 的 DSN 前缀在 `chooseDB` 里被**识别但拒绝**（主库→"仅日志库允许"、
 日志库→"尚未引入"），失败信息明确指向未来里程碑，而不是静默按 MySQL 去连。
 
-**风险与退路**：`github.com/glebarez/sqlite` 传递依赖的 `modernc.org/sqlite` 新版本若要求 Go > 1.23，
-则回退为 `gorm.io/driver/sqlite`（CGO）。本机有 gcc 13.2，可编译；代价是 Docker 构建需非 scratch 基础镜像
-且 `CGO_ENABLED=1`。**此风险在实施第 1 步就验证，不拖到收尾。**
+**风险已消除（规划期实测）**：上表全部依赖在 `go1.23.2 windows/amd64` 下 `go mod tidy` + `go build ./...`
+均成功（临时模块实测，退出码 0）。纯 Go SQLite 驱动可用，**不需要 CGO 回退**，
+Docker 构建可保持 `CGO_ENABLED=0`。上表版本即为实测通过的版本，实施时按此锁定。
 
 ---
 
@@ -607,12 +696,19 @@ ClickHouse 驱动。ClickHouse 的 DSN 前缀在 `chooseDB` 里被**识别但拒
 | 测试文件 | 保护的真实契约 |
 |---|---|
 | `internal/common/quota_math_test.go` | 三档语义表驱动：正常/±Inf/NaN/超界/负数/round-half/`MaxWalletQuota` 边界；`AdminMap` 内容 |
-| `internal/setting/config/config_test.go` | key 生成（`module.jsonField`）、`ExportAllConfigs`、反射写回四种类型、未知 key 报错、类型不符报错且不写入、缺 json tag 时 `Register` panic、重复注册 panic |
-| `internal/setting/system_setting/system_setting_test.go` | 快照原子替换；并发读到的一定是完整版本（`-race` 下跑） |
-| `internal/model/main_test.go` | `chooseDB` 前缀分派（含主库拒 ClickHouse、日志库拒未实现驱动）、`lockForUpdate` 在 SQLite 下不产生 `FOR UPDATE`、`AutoMigrate` 连续三次幂等、非 master 不迁移、`logs` 落在 `LOG_SQL_DSN` 指定的库而主库无此表 |
+| `internal/common/env_test.go` | 零环境变量时的默认值；非法数值回退默认值；`SYNC_FREQUENCY` 下限钳制并产生告警 |
+| `internal/logger/logger_test.go` | `SetLevel` 立即生效（不是下次重载才生效）；`SetupLogger` 之前调用 `Logger()` 不 panic |
+| `internal/cachex/counter_test.go` | Redis 不可用时的内存后端；并发 `Incr` 不丢计数（`-race` 下跑）；不同 key 互不干扰 |
+| `internal/setting/config/config_test.go` | key 生成（`module.jsonField`）、`ExportAllConfigs`、反射写回五种类型、未知 key 报错、类型不符报错且不写入、**`ValidateConfig` 无副作用且接受集合与 `UpdateConfig` 一致**、缺 json tag / 类型不支持时 `Register` panic、重复注册 panic |
+| `internal/setting/system_setting/system_setting_test.go` | 快照原子替换；并发读到的一定是完整版本（`-race` 下跑）；旧快照不被改写 |
+| `internal/model/main_test.go` | `chooseDB` 前缀分派（含主库拒 ClickHouse、日志库拒未实现驱动）、`lockForUpdate` 在 SQLite 下不产生 `FOR UPDATE`（且在 MySQL/PG 下**确实产生**——挡住 GORM v2 静默忽略 `gorm:query_option` 的坑）、`AutoMigrate` 连续三次幂等、非 master 不迁移、`logs` 落在 `LOG_SQL_DSN` 指定的库而主库无此表、**列名与复合主键**（列名是 ABI；同时钉住"无 `deleted_at` 软删除列"） |
 | `internal/constant/constants_test.go` | 枚举数值 golden 断言：任何重编号都必须让测试失败（ABI 保护） |
-| `internal/model/option_test.go` | `InitOptionMap` 默认值 → DB 覆盖；`UpdateOption` 单一路径三者同时变；`SyncOptions` 在外部改库后收敛；未知 key 被拒 |
-| `internal/app/app_test.go` | `Run(ctx)` 取消后：在途请求拿到完整响应、DB 已关闭、后台 goroutine 已退出 |
+| `internal/model/option_test.go` | `InitOptionMap` 默认值 → DB 覆盖、脏数据跳过不阻断启动；`UpdateOption` 单一路径三者同时变；**非法输入一个字节都不写**（库里不留行）；`log_level` 副作用立即生效；`SyncOptions` 在外部改库后收敛且**只应用变化项** |
+| `internal/middleware/middleware_test.go` | request id 入站沿用/缺失生成/可从 context 读取；panic → 500 JSON **且不泄漏堆栈**；route tag 按前缀分派；访问日志可热关闭但**计数继续**；CORS 通配、白名单回显带 `Vary`、白名单外不回显 ACAO |
+| `internal/controller/status_test.go` | `/api/status` 的 JSON 形状逐字段断言（验收③的观察窗）；配置改动立即反映；**响应体不含 DSN 全文与密钥** |
+| `internal/router/router_test.go` | `/api/status` 可达且中间件链生效；`/v1/*` 与 `/api/*` 未实现路径返回 JSON 404，**不被 SPA 兜底吞成 200+HTML** |
+| `internal/app/app_test.go` | `Run(ctx)` 取消后：在途请求拿到完整响应、DB 句柄已关闭并置空、后台 goroutine 已退出；端口占用时快速返回错误 |
+| `cmd/optctl/main_test.go` | `set` → `get` 往返；`list` 含全部注册项；非法输入报错且**不落库**（它是唯一能从进程外改配置的入口） |
 
 测试纪律（照 blueprint §8）：**不为小改动在每层加测试文件，不写只提升覆盖率数字的测试，
 不写随机输入/大循环/计时的伪压力测试。测试保护真实契约，不保护行数。**
@@ -658,13 +754,27 @@ ClickHouse 驱动。ClickHouse 的 DSN 前缀在 `chooseDB` 里被**识别但拒
 1 chore: 初始化 Go module、目录骨架与交付物脚手架
 2 feat(common): 数值安全、JSON 封装、环境变量与 Redis 封装
 3 feat(setting): 反射驱动的配置注册表与原子快照
-4 feat(model): 六张核心表模型、持久化枚举、三库兼容的 DB 初始化与幂等迁移
+4 feat(model): 七张核心表模型（含落在日志库的 logs）、三库兼容的 DB 初始化与幂等迁移
 5 feat(model): Option 表与配置唯一写入路径（UpdateOption / SyncOptions）
 6 feat(http): 中间件链、路由分组与 /api/status
 7 feat(app): 启动时序与优雅停机
 8 test: M0 验收脚本
 9 docs: README、环境变量清单与实施文档
 ```
+
+实施时每个任务内部还会按 TDD 再拆提交（"写测试 → 实现 → 通过"各一次），
+因此实际提交数会多于上表的 9 条。这是有意的：**每条提交都应该是可编译、
+可测试的状态**，便于 review 时逐条回滚。
+
+### 实施计划（本设计的两份计划文件）
+
+| 计划 | 范围 | 完成标志 |
+|---|---|---|
+| `plans/2026-10-12-m0-foundation.md` | 基础层：模块骨架、常量、环境变量、JSON、数值安全、logger、缓存、配置注册表与快照 | `go build ./... && go vet ./... && go test -race ./...` 全绿（尚无可运行的二进制） |
+| `plans/2026-10-12-m0-runtime.md` | 运行时与交付：七个模型与迁移、配置写入路径、中间件、controller、router、`app.Run`、optctl、Docker、README、验收脚本 | 四条验收标准（本机可验证部分）通过 |
+
+拆成两份的理由：**每份计划结束时都处于一个可独立验证的状态**。
+基础层全绿之后再开始写运行时，任何失败都能立刻定位到"是这一层引入的"。
 
 完成后推分支并按 `pr-submission-standard` 模板开 PR（功能描述 / 实现思路 / 测试方式 三段）。
 
