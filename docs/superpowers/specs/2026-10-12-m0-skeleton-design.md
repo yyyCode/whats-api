@@ -7,7 +7,7 @@
 - 日期：2026-10-12
 - 分支：`feat/m0-skeleton`
 - 模块路径：`github.com/yyyCode/whats-api`
-- Go 版本：`go 1.23`（跟随本机 go1.23.2 windows/amd64）
+- Go 版本：`go 1.23.0`（工具链 `toolchain go1.23.2`，跟随本机 go1.23.2 windows/amd64）
 
 ---
 
@@ -103,14 +103,17 @@ whats-api/
 **依赖方向（自上而下，同层不互相依赖）**：
 
 ```
-app → router → controller → { middleware, model } → { setting/config, cachex } → { common, constant }
+app → router → controller → { middleware, model } → { setting/config, cachex } → common → logger
 
 logger：横切工具，只依赖标准库，任何层都可以 import（包括 common）
+constant：持久化枚举，只依赖标准库；由 model 使用，不在上面这条链上
 ```
 
-- 即：`logger`、`constant` 不 import 本项目其他包（叶子）；`common` 只依赖这两个叶子
+- 即：`logger` 与 `constant` 不 import 本项目其他包（叶子）；**`common` 只依赖 `logger` 这一个叶子**
   （Redis 初始化期连不上要立刻告警，那一步 logger 已经就绪；`InitEnv` 之所以只能攒 `EnvWarnings`，
-  是因为它跑在 logger 之前）；`setting` 与 `cachex` 只依赖 `common`/`logger`；
+  是因为它跑在 logger 之前）。`common` **不引用** `internal/constant`——持久化枚举是给 model 层用的，
+  与这里的启动期默认值目的不同（这里的默认值回答"没配环境变量时用什么"，constant 里的是"已经写进
+  库里的值不能变"）。`setting` 与 `cachex` 只依赖 `common`/`logger`；
   `model` 依赖 `setting/config`、`constant` 与 `common`；`middleware` 依赖 `setting` 与 `logger`；
   `controller` 依赖 `model`。
 - `middleware` 不 import `controller`；`controller` 不 import `router`。
@@ -163,6 +166,9 @@ M0 没有任何慢到能观察到停机排水的生产端点，测试靠注入�
 **关键顺序约束（全部写进代码注释）**：
 
 1. `InitOptionMap()` 必须在任何读配置的模块之前——包括 `InitLogDB`（日志库 DSN 将来可配置）。
+   `logger.SetupLogger(LOG_LEVEL)` 又要**先于任何配置读取**：它会用 `LOG_LEVEL` 重写日志级别，
+   若配置域先读到 `system_setting.log_level` 并调了 `SetLevel`，那次设置会被随后的 `SetupLogger`
+   静默覆盖（现象是"改了日志级别没反应"）。正确顺序：`InitEnv → SetupLogger → 读配置 → SetLevel`。
 2. **停机顺序：先 `srv.Shutdown`（等在途请求），再 `wg.Wait()`（等后台 goroutine），最后 `CloseDB()`。**
    顺序颠倒会让后台 goroutine 在停机期写到已关闭的连接上——
    那类错误只在停机瞬间偶发，平时测得再多次也遇不到。
@@ -211,7 +217,13 @@ var GlobalConfig = NewManager()
 // 约束（启动期 fail-fast）：
 //   - 同一 name 重复注册 → panic
 //   - 非指针 / 非结构体 → panic
+//   - 模块名含 '.' → panic（'.' 是 key 的分隔符，名字里的点会让 key 拆不开，不同模块撞进同一个 key）
 //   - 存在没有 json tag 的导出字段 → panic（key 由 module + json tag 生成，缺 tag 会导致命名漂移）
+//   - json tag 含 '.' → panic（它就是 key 的分隔符）
+//   - json tag 重复 → panic
+//   - 字段类型不在 M0 白名单（string/bool/int/int64/float64）→ panic
+//   - float64 默认值是 NaN/±Inf → panic（编不出 JSON，会让 Option 表默认值出现一个非 JSON 的 ""）
+//   - 带 json:"-" 的字段是「显式排除」，跳过而非 panic；未导出字段同样跳过
 func (m *Manager) Register(name string, cfg any)
 
 // ExportAllConfigs 返回所有注册域的默认值：key = "<module>.<jsonField>", value = JSON 编码
@@ -237,6 +249,14 @@ func (m *Manager) Modules() []string
 （写配置域的人以为这个字段可配置，实际永远改不了），必须在启动时就炸出来；
 放到 `UpdateConfig` 报错则意味着服务能正常跑、直到有人尝试改那一项才发现。
 fail-fast 的位置应该在"错误被引入的地方"，而不是"错误被发现的地方"。
+
+**M0 的校验范围（明确的边界，不是 TODO）**：注册与写入只保证**类型**与**可表示范围**——
+值能装进同类型的字段、且不越界。M0 **没有**任何逐字段的语义校验：没有 min/max、没有枚举成员检查、
+没有"这个值合不合法"的业务判断。也**没有任何东西强制**某个配置域注册 `OnRebuild` 钩子：注册了是契约，
+漏注册不会被拦住（后果是 `Get()` 一直返回旧快照）。这两条都留给 M1 之后按真实需要引入，M0 不假装具备。
+
+另外 `UpdateConfig(key, "null")` 被**直接拒绝**：`json.Unmarshal` 对 null 不报错，会把它静默解析成零值
+（`sync_frequency` 60 → 0 这种）。管理端的一次非法请求不能悄悄把运行中的配置改坏。
 
 **`ValidateConfig` 为什么单独存在**：配置的写入路径是 `校验 → 落库 → 改内存`
 （见 §4.4）。校验必须先于落库——否则一个非法值会先落进库里，再被别的实例同步过去，
@@ -266,18 +286,18 @@ type SystemSetting struct {
     SlowRequestThresholdSeconds float64 `json:"slow_request_threshold_seconds"`
 }
 
-var defaultValue = SystemSetting{
+var Default = SystemSetting{
     LogLevel: "info", StatusMessage: "M0 技术骨架运行中",
     EnableAccessLog: true, SlowRequestThresholdSeconds: 3,
 }
 
 var (
     current    atomic.Pointer[SystemSetting] // 热路径读的不可变快照
-    registered = defaultValue                // ★ 反射写入目标；只允许在 Manager 写锁内被访问
+    registered = Default                     // ★ 反射写入目标；只允许在 Manager 写锁内被访问
 )
 
 func init() {
-    d := defaultValue
+    d := Default
     current.Store(&d)
     config.GlobalConfig.Register("system_setting", &registered) // schema、默认值、持久化 key 的唯一来源
     config.GlobalConfig.OnRebuild("system_setting", func() {
@@ -485,29 +505,37 @@ LogType:       Unknown=0, Consume=1, Topup=2, Manage=3, System=4, Error=5, Refun
 
 ```go
 // internal/common/redis.go
+// 句柄是**未导出**的 atomic：可用性在每个请求上被读到，Init/Close 是写方。
 var (
-    RedisEnabled bool          // REDIS_CONN_STRING 有效且 PING 通过
-    RDB          *redis.Client // 未启用时为 nil
+    redisEnabled atomic.Bool
+    rdb          atomic.Pointer[redis.Client]
 )
-func InitRedisClient()   // 非致命：连接失败 → RedisEnabled=false + WARN，继续启动
-func NormalizeRedisURL(raw string) string
+func LoadRedis() *redis.Client   // 当前客户端；未启用时返回 nil
+func RedisEnabled() bool         // 是否有可用的客户端（== LoadRedis() != nil）
+func InitRedisClient()           // 非致命：连接失败 → 降级 + WARN，继续启动
+func normalizeRedisURL(s string) string   // 内部实现细节，不导出（只补 redis:// 前缀、去空白）
 func RedisGet / RedisSet / RedisDel / RedisIncr / RedisKeyCacheSeconds
-func CloseRedis() error
+func CloseRedis() error          // 关闭并清空句柄；此后 RedisEnabled() == false
 ```
 
 ```go
 // internal/cachex — M0 只有一种原语：计数器
 type Counter struct { namespace string; ttl time.Duration }
 func NewCounter(namespace string, ttl time.Duration) *Counter
-func (c *Counter) Incr(key string) (int64, error)  // Redis: INCR + EXPIRE 走 pipeline
-func (c *Counter) Get(key string) (int64, bool)
-func (c *Counter) Backend() string                  // "redis" / "memory"
+func (c *Counter) Incr(key string) (int64, error)  // Redis: INCR + EXPIRE 走 pipeline；失败回落内存
+func (c *Counter) Get(key string) (int64, bool)    // Redis 出错同样回落内存，与 Incr 对称
+func (c *Counter) Backend() string                  // 报告**选用**的后端："redis" / "memory"
 ```
 
-- Redis 可用 → 走 Redis；不可用 → 进程内实现（`sync.Map` + 滑动 TTL）。
+- Redis 可用 → 走 Redis；不可用 → 进程内实现（`map[string]counterEntry` + 滑动 TTL）。
 - 两种后端的语义差异（TTL 精度、原子性）封在实现内部；`Incr` 在内存后端用
-  `sync.Mutex` + 计数器保证原子。Redis 路径运行期失败时**逐次降级到内存**，
-  而不是让一次 Redis 抖动升级成请求失败。
+  `sync.Mutex` + 计数器保证原子。**Redis 路径运行期失败时逐次降级到内存**，
+  且 `Incr` 与 `Get` **方向对称**：否则掉线期间 `Incr` 写进内存而 `Get` 去读 Redis 得到 miss，
+  刚加上的计数立刻"不存在"。一次 Redis 抖动不该升级成请求失败。
+  （`ErrRedisDisabled` 只表示"启动期就没启用"，运行中掉线返回的是驱动的原始错误；
+  所以要降级的调用方对**任何** error 都回退，而不是只认哨兵。）
+- `Backend()` 报告的是**选用**的后端（配置 + 启动期探测的结果），**不含**运行期单次调用的成败：
+  启动时连通、之后掉线时它仍返回 `"redis"`，而 `Incr`/`Get` 已经在回落到内存。
 - **M0 的真实用途**：`requests_total` 计数器（`/api/status` 暴露）。
   这样"拔掉 Redis 也能启动并继续工作"不是空话，是可断言的观察点。
 - 不使用 Redis 做配置同步（那是 `SyncOptions` 的 DB 轮询路径，M0 不引入 Redis 发布订阅）。
@@ -640,7 +668,7 @@ func QuotaRoundChecked(f float64) (int, QuotaClamp)
 func QuotaRoundStrict(f float64) (int, error)
 func QuotaFromDecimal(s string) int                                 // shopspring/decimal，避免字符串价格走 float
 func QuotaFromDecimalChecked(s string) (int, QuotaClamp)            // 溢出/NaN 留痕
-func QuotaFromDecimalStrict(s string) (int, error)                  // 溢出/解析失败即错（预扣）
+func QuotaFromDecimalStrict(s string) (int, error)                  // 溢出/解析失败即错（预扣）；非数字包 ErrQuotaNaN 哨兵
 ```
 
 **饱和语义（本项目的决定，写进账本语义前请复核）**：
@@ -658,20 +686,32 @@ func QuotaFromDecimalStrict(s string) (int, error)                  // 溢出/�
 
 `QuotaRound` 用于分层计费，保证预扣与结算不差 ±1 quota。
 
+**负号在取整之前判**：`math.Round(-0.4)` 是 `-0`，而 Go 里 `-0 < 0` 为假——若先取整再判符号，
+一个负数金额会被当成正常值。所以 `QuotaRoundChecked`/`QuotaRoundStrict` 与 `decimalToQuota`
+都**先判符号再取整**，三档（Float / Round / Decimal）对同一输入的判定必须一致：
+
+- `-0.4` → 三档都给 `0` 且 `ClampUnderflow`（Decimal 档同样，不因取整后为 0 而变 `ClampNone`）；
+- `-0` / `0` 都不是负数 → 三档都给 `0` 且 `ClampNone`。
+
+`QuotaFromDecimalStrict` 对无法解析的字符串（非数字、空串）用 `fmt.Errorf("%w：…", ErrQuotaNaN, …)`
+把 `ErrQuotaNaN` 包上——这样 Checked 档的 `ClampNaN`、浮点 Strict 档的 `ErrQuotaNaN` 与本档共享同一个
+`errors.Is` 可识别的哨兵。shopspring 没有导出解析错误变量，原始错误只能以文本形式附在消息里。
+
 ---
 
 ## 9. 依赖
 
 | 依赖 | 用途 | 版本 |
 |---|---|---|
-| `github.com/gin-gonic/gin` | HTTP | v1.12.0 |
+| `github.com/gin-gonic/gin` | HTTP | **v1.11.0（刻意不升，见下）** |
 | `gorm.io/gorm` | ORM | v1.31.2 |
 | `gorm.io/driver/mysql` | MySQL | v1.6.0 |
-| `gorm.io/driver/postgres` | PostgreSQL | v1.6.3 |
+| `gorm.io/driver/postgres` | PostgreSQL | **v1.6.0（刻意不升，见下）** |
 | `github.com/glebarez/sqlite` | 纯 Go SQLite（免 CGO） | v1.11.0（modernc.org/sqlite v1.23.1） |
 | `github.com/go-redis/redis/v8` | Redis（文档指定 v8） | v8.11.5 |
 | `github.com/shopspring/decimal` | `QuotaFromDecimal` | v1.5.0 |
 | `github.com/joho/godotenv` | `.env` | v1.5.1 |
+| `github.com/go-sql-driver/mysql`（间接） | MySQL 驱动底层 | v1.8.1 |
 
 **不引入**：测试框架（用标准 `testing`）、日志库（用标准 `log/slog`）、内存 LRU 库（`cachex` 自己实现）、
 ClickHouse 驱动。ClickHouse 的 DSN 前缀在 `chooseDB` 里被**识别但拒绝**（主库→"仅日志库允许"、
@@ -680,6 +720,14 @@ ClickHouse 驱动。ClickHouse 的 DSN 前缀在 `chooseDB` 里被**识别但拒
 **风险已消除（规划期实测）**：上表全部依赖在 `go1.23.2 windows/amd64` 下 `go mod tidy` + `go build ./...`
 均成功（临时模块实测，退出码 0）。纯 Go SQLite 驱动可用，**不需要 CGO 回退**，
 Docker 构建可保持 `CGO_ENABLED=0`。上表版本即为实测通过的版本，实施时按此锁定。
+
+**⚠️ 版本钉子：`gorm.io/driver/postgres` 停在 v1.6.0、`gin` 停在 v1.11.0，不要随手 `go get -u`。**
+两者各自的下一个版本都在自身 `go.mod` 里声明 `go 1.25.0`（postgres v1.6.1+、gin v1.12.0），
+`go get` 会顺手把本模块的 `go` 行与 toolchain 一起顶到 Go 1.25——直接违反 M0 的 `go 1.23.0` 约束。
+postgres v1.6.0 声明 `go 1.20`、gin v1.11.0 声明 `go 1.23.0`，均安全。间接依赖同样要钉：
+`github.com/jackc/pgx/v5 v5.7.6`（v5.8.0+ 需 Go ≥1.24）。**升级任何一项前，先看它 `go.mod` 里的 `go` 行**；
+`go get` 后回头核对 `<go 行仍是 1.23.0>`：`go list -m -f '{{.GoVersion}}' all` 不得出现高于 1.23 的项。
+（`golang.org/x/{sync,text,sys,crypto}` 由 gin 间接决定，无需手工钉；加固时实测它们声明的都是 `go 1.23.0`。）
 
 ---
 
@@ -700,11 +748,11 @@ Docker 构建可保持 `CGO_ENABLED=0`。上表版本即为实测通过的版本
 
 | 测试文件 | 保护的真实契约 |
 |---|---|
-| `internal/common/quota_math_test.go` | 三档语义表驱动：正常/±Inf/NaN/超界/负数/round-half/`MaxWalletQuota` 边界；`AdminMap` 内容 |
-| `internal/common/env_test.go` | 零环境变量时的默认值；非法数值回退默认值；`SYNC_FREQUENCY` 下限钳制并产生告警 |
-| `internal/logger/logger_test.go` | `SetLevel` 立即生效（不是下次重载才生效）；`SetupLogger` 之前调用 `Logger()` 不 panic |
-| `internal/cachex/counter_test.go` | Redis 不可用时的内存后端；并发 `Incr` 不丢计数（`-race` 下跑）；不同 key 互不干扰 |
-| `internal/setting/config/config_test.go` | key 生成（`module.jsonField`）、`ExportAllConfigs`、反射写回五种类型、未知 key 报错、类型不符报错且不写入、**`ValidateConfig` 无副作用且接受集合与 `UpdateConfig` 一致**、缺 json tag / 类型不支持时 `Register` panic、重复注册 panic |
+| `internal/common/quota_math_test.go` | 三档语义表驱动：正常/±Inf/NaN/超界/负数/round-half/`MaxWalletQuota` 边界；`AdminMap` 内容；**负小数 `-0.4` 下 Float/Round/Decimal 三档判定一致（都 `ClampUnderflow`），`-0`/`0` 都 `ClampNone`** |
+| `internal/common/env_test.go` | 零环境变量时的默认值；非法数值回退默认值；`SYNC_FREQUENCY` 与 `SHUTDOWN_TIMEOUT_SECONDS` 下限钳制并产生告警；`PORT` 越界（0/负/超 65535）回退默认值、边界值放行；`NODE_TYPE` 大小写不敏感、未知值告警并回退；`CORS_ALLOW_ORIGINS` 配了但无有效项 → 空列表（拒绝一切）而非回落 `*` |
+| `internal/logger/logger_test.go` | `SetLevel` 立即生效（不是下次重载才生效）；`SetupLogger` 之前调用 `Logger()` 不 panic；**`SetupLogger` 会覆盖此前 `SetLevel` 设的值（钉住"顺序不能反"）** |
+| `internal/cachex/counter_test.go` | Redis 不可用时的内存后端；并发 `Incr` 不丢计数（`-race` 下跑）；不同 key 互不干扰；内存后端 TTL 是滑动窗口（与 Redis 的 INCR+EXPIRE 一致） |
+| `internal/setting/config/config_test.go` | key 生成（`module.jsonField`）、`ExportAllConfigs`、反射写回五种类型、未知 key 报错、类型不符报错且不写入、**`ValidateConfig` 无副作用且接受集合与 `UpdateConfig` 一致**、缺 json tag / 类型不支持时 `Register` panic、重复注册 panic、**模块名或 json tag 含 `.` 时 panic、`json:"-"` 被跳过而非 panic、float64 默认值 NaN/±Inf 时 panic、匿名结构体报错信息可读**、`UpdateConfig(key, "null")` 被拒 |
 | `internal/setting/system_setting/system_setting_test.go` | 快照原子替换；并发读到的一定是完整版本（`-race` 下跑）；旧快照不被改写 |
 | `internal/model/main_test.go` | `chooseDB` 前缀分派（含主库拒 ClickHouse、日志库拒未实现驱动）、`lockForUpdate` 在 SQLite 下不产生 `FOR UPDATE`（且在 MySQL/PG 下**确实产生**——挡住 GORM v2 静默忽略 `gorm:query_option` 的坑）、`AutoMigrate` 连续三次幂等、非 master 不迁移、`logs` 落在 `LOG_SQL_DSN` 指定的库而主库无此表、**列名与复合主键**（列名是 ABI；同时钉住"无 `deleted_at` 软删除列"） |
 | `internal/constant/constants_test.go` | 枚举数值 golden 断言：任何重编号都必须让测试失败（ABI 保护） |
@@ -738,17 +786,17 @@ Docker 构建可保持 `CGO_ENABLED=0`。上表版本即为实测通过的版本
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `PORT` | `3000` | HTTP 监听端口 |
+| `PORT` | `3000` | HTTP 监听端口；超出 1–65535 视为配置错误，回退默认值并告警 |
 | `SQL_DSN` | 空 → `whats-api.db`（SQLite） | 主库 DSN，按前缀选驱动 |
 | `LOG_SQL_DSN` | 空 → 复用主库 | 日志库 DSN |
 | `REDIS_CONN_STRING` | 空 → 进程内缓存 | Redis 连接串；无效即降级 |
-| `NODE_TYPE` | `master` | `master` / `slave`；仅 master 执行迁移 |
+| `NODE_TYPE` | `master` | `master` / `slave`；大小写不敏感；仅 master 执行迁移；无法识别的值告警并回退 `master` |
 | `NODE_NAME` | 空 | 实例标识，M0 仅展示 |
-| `SYNC_FREQUENCY` | `60` | 配置定时同步秒数，最小 5 |
-| `SHUTDOWN_TIMEOUT_SECONDS` | `120` | 优雅停机超时（SSE 可能跑几分钟，别调小） |
+| `SYNC_FREQUENCY` | `60` | 配置定时同步秒数，最小 5（低于下限抬回并告警） |
+| `SHUTDOWN_TIMEOUT_SECONDS` | `120` | 优雅停机超时（SSE 可能跑几分钟，别调小）；低于下限 5 秒抬回并告警 |
 | `LOG_LEVEL` | `info` | 启动期日志级别，可在库配置中覆盖 |
 | `GIN_MODE` | `release` | gin 运行模式 |
-| `CORS_ALLOW_ORIGINS` | `*` | 允许的跨域来源，逗号分隔 |
+| `CORS_ALLOW_ORIGINS` | `*` | 允许的跨域来源，逗号分隔；**配了但无有效项（如 `","`）→ 空列表（拒绝一切）+ 告警，绝不回落 `*`** |
 | `SESSION_SECRET` | — | **M0 未使用**（鉴权在 M1/M3），先列入 `.env.example` 注释 |
 
 ### 提交计划（`feat/m0-skeleton` 分支）

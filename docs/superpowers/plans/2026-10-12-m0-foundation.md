@@ -20,7 +20,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `go.mod` | 模块定义，`go 1.23` |
+| `go.mod` | 模块定义，`go 1.23.0`（toolchain go1.23.2） |
 | `.gitignore` / `.env.example` | 本地数据与构建产物忽略；环境变量样例（含默认值说明） |
 | `internal/constant/constants.go` | 持久化枚举。ABI：只增不改 |
 | `internal/common/constants.go` | 版本号、默认值常量、缓存键前缀 |
@@ -56,9 +56,9 @@ Expected: 在 `feat/m0-skeleton` 分支上，HEAD 是设计文档的提交。
 - [ ] **Step 2: 初始化 Go module**
 
 Run: `go mod init github.com/yyyCode/whats-api`
-Expected: 生成 `go.mod`，内容为 `module github.com/yyyCode/whats-api` 与 `go 1.23`。
-如果它写的 go directive 高于 1.23（取决于本机 go 版本，本机是 1.23.2，所以应是 `go 1.23`），
-手工改成 `go 1.23` 再继续。
+Expected: 生成 `go.mod`，内容为 `module github.com/yyyCode/whats-api` 与 `go 1.23.0`。
+如果它写的 go directive 是 `go 1.23.2`（本机 go 版本），手工改成 `go 1.23.0` 并补一行
+`toolchain go1.23.2`，再继续——把语言版本与工具链版本分开写，别让工具链顶高 `go` 行。
 
 - [ ] **Step 3: 写 `.gitignore`**
 
@@ -356,6 +356,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 package common
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -468,6 +469,7 @@ func TestInitEnvClampsSyncFrequencyAndWarns(t *testing.T) {
 func TestInitEnvDoesNotWarnAtExactMinimum(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("SYNC_FREQUENCY", "5")
+	t.Setenv("SHUTDOWN_TIMEOUT_SECONDS", "5")
 	InitEnv()
 
 	if SyncFrequency != MinSyncFrequencySeconds || len(EnvWarnings) != 0 {
@@ -475,13 +477,160 @@ func TestInitEnvDoesNotWarnAtExactMinimum(t *testing.T) {
 	}
 }
 
+// 优雅退出的超时会被当成 deadline 用，0 或负数等于"立刻取消"，
+// 等于把优雅退出变成强杀；太大则让容器停不下来。下限必须被抬回来。
+func TestInitEnvClampsShutdownTimeout(t *testing.T) {
+	for _, in := range []string{"0", "-1"} {
+		t.Run(in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("SHUTDOWN_TIMEOUT_SECONDS", in)
+			InitEnv()
+
+			if ShutdownTimeout != MinShutdownTimeoutSeconds {
+				t.Errorf("SHUTDOWN_TIMEOUT_SECONDS=%s 应被抬到下限 %d，得到 %d",
+					in, MinShutdownTimeoutSeconds, ShutdownTimeout)
+			}
+			if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], "SHUTDOWN_TIMEOUT_SECONDS") {
+				t.Errorf("应产生一条 SHUTDOWN_TIMEOUT_SECONDS 告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+}
+
+// 端口超出 1-65535 是配置错误：回退默认值并告警，而不是把 0 端口交给监听。
+func TestInitEnvRejectsOutOfRangePort(t *testing.T) {
+	for _, in := range []string{"0", "-1", "65536", "99999"} {
+		t.Run(in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("PORT", in)
+			InitEnv()
+
+			if Port != DefaultPort {
+				t.Errorf("PORT=%s 应回退 %d，得到 %d", in, DefaultPort, Port)
+			}
+			if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], "PORT") {
+				t.Errorf("应产生一条 PORT 告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+
+	// 边界值合法，不该被误伤。
+	for _, in := range []string{"1", "65535"} {
+		t.Run("边界 "+in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("PORT", in)
+			InitEnv()
+
+			if port, _ := strconv.Atoi(in); Port != port {
+				t.Errorf("PORT=%s 是合法端口，不该被改，得到 %d", in, Port)
+			}
+			if len(EnvWarnings) != 0 {
+				t.Errorf("合法端口不该告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+}
+
+// 大小写不该决定主从：NODE_TYPE=Slave 若按原样比较，从节点会被判成主节点，
+// 从而去跑迁移——这是"多节点同时建表"最直接的来源。
+func TestInitEnvNodeTypeIsCaseInsensitive(t *testing.T) {
+	cases := []struct {
+		in         string
+		wantMaster bool
+	}{
+		{"master", true},
+		{"MASTER", true},
+		{"Master", true},
+		{"slave", false},
+		{"SLAVE", false},
+		{"Slave", false},
+		{"  slave  ", false}, // envStr 会去空白
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("NODE_TYPE", c.in)
+			InitEnv()
+
+			if IsMasterNode != c.wantMaster {
+				t.Errorf("NODE_TYPE=%q 时 IsMasterNode = %v，期望 %v", c.in, IsMasterNode, c.wantMaster)
+			}
+			if len(EnvWarnings) != 0 {
+				t.Errorf("大小写差异不该告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+}
+
+// 认不出来的取值按默认处理，但必须告警——否则运维写错一个词，
+// 主从角色就静默变了，而日志里什么都没有。
+func TestInitEnvWarnsOnUnknownNodeType(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("NODE_TYPE", "primary")
+	InitEnv()
+
+	if NodeType != DefaultNodeType || !IsMasterNode {
+		t.Errorf("NODE_TYPE=primary 应按默认 %q 处理，得到 %q", DefaultNodeType, NodeType)
+	}
+	if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], "NODE_TYPE") {
+		t.Errorf("应产生一条 NODE_TYPE 告警，得到 %v", EnvWarnings)
+	}
+}
+
+// CORS_ALLOW_ORIGINS 配了但一个有效条目都没有（如 ","）：必须按"谁都不允许"
+// 处理并告警，绝不能回落到默认值 "*"——那是允许所有来源，
+// 会把一次本想收紧的配置变成完全放开。
+func TestInitEnvTreatsEmptyCORSListAsDenyAll(t *testing.T) {
+	for _, in := range []string{",", " , ", ",,"} {
+		t.Run(in, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("CORS_ALLOW_ORIGINS", in)
+			InitEnv()
+
+			if len(CORSAllowOrigins) != 0 {
+				t.Errorf("CORS_ALLOW_ORIGINS=%q 应得到空列表，得到 %v", in, CORSAllowOrigins)
+			}
+			for _, o := range CORSAllowOrigins {
+				if o == "*" {
+					t.Fatalf("CORS_ALLOW_ORIGINS=%q 回落到通配符 %q，等于完全放开", in, o)
+				}
+			}
+			if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], "CORS_ALLOW_ORIGINS") {
+				t.Errorf("应产生一条 CORS_ALLOW_ORIGINS 告警，得到 %v", EnvWarnings)
+			}
+		})
+	}
+}
+
 // 非法数值不致命：回退默认值继续启动，而不是启动不了。
+// 但回退必须留痕——否则 PORT=abc 会安安静静跑在默认端口上，
+// 而运维以为服务听在他们配的端口上。
 func TestInitEnvFallsBackOnInvalidNumbers(t *testing.T) {
+	cases := []struct {
+		key string
+		val string
+	}{
+		{"PORT", "not-a-port"},
+		{"PORT", "3000.5"},
+		{"SHUTDOWN_TIMEOUT_SECONDS", "abc"},
+		{"SYNC_FREQUENCY", "60秒"},
+	}
+	for _, c := range cases {
+		t.Run(c.key+"="+c.val, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(c.key, c.val)
+			InitEnv()
+
+			if len(EnvWarnings) != 1 || !strings.Contains(EnvWarnings[0], c.key) {
+				t.Errorf("%s=%q 回退默认值时应留下一条告警，得到 %v", c.key, c.val, EnvWarnings)
+			}
+		})
+	}
+
 	clearEnv(t)
 	t.Setenv("PORT", "not-a-port")
 	t.Setenv("SHUTDOWN_TIMEOUT_SECONDS", "abc")
 	InitEnv()
-
 	if Port != DefaultPort {
 		t.Errorf("非法 PORT 应回退 %d，得到 %d", DefaultPort, Port)
 	}
@@ -503,7 +652,10 @@ Expected: FAIL — `undefined: InitEnv` 等编译错误。
 ```go
 // Package common 是基础设施层：启动期常量、JSON 编解码、数值安全、Redis 封装。
 //
-// 它只依赖 internal/logger 与 internal/constant——两个只依赖标准库的叶子包。
+// 它只依赖 internal/logger（一个只依赖标准库的横切叶子包）。
+// 持久化枚举在 internal/constant，那是给 model 层用的，common 不引用它——
+// 这两处常量服务的目的不同：这里的默认值是"没配环境变量时用什么"，
+// constant 里的是"已经写进库里的值不能变"。
 package common
 
 // Version 出现在启动日志、/api/status 与响应头 X-Whats-Api-Version。
@@ -527,6 +679,12 @@ const (
 
 // MinSyncFrequencySeconds 是同步间隔的下限：再低就是在把业务库当轮询靶子。
 const MinSyncFrequencySeconds = 5
+
+// MinShutdownTimeoutSeconds 是优雅退出超时的下限。
+//
+// 它必须大于 0：超时会变成 context.WithTimeout 的 deadline，0 或负数
+// 意味着"立刻取消"——正在处理的请求会被直接掐断，优雅退出就成了强杀。
+const MinShutdownTimeoutSeconds = 5
 ```
 
 - [ ] **Step 4: 写 `env.go`**
@@ -537,6 +695,7 @@ const MinSyncFrequencySeconds = 5
 package common
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -573,26 +732,53 @@ var (
 func InitEnv() {
 	EnvWarnings = nil
 
-	Port = envInt("PORT", DefaultPort)
+	var warn string
+
+	Port, warn = envInt("PORT", DefaultPort)
+	appendEnvWarning(warn)
+	if Port < 1 || Port > 65535 {
+		EnvWarnings = append(EnvWarnings, fmt.Sprintf(
+			"PORT=%d 不是合法端口（1-65535），已回退默认值 %d", Port, DefaultPort))
+		Port = DefaultPort
+	}
+
 	GinMode = envStr("GIN_MODE", "release")
-	CORSAllowOrigins = envList("CORS_ALLOW_ORIGINS", DefaultCORSAllowOrigins)
+	CORSAllowOrigins, warn = envList("CORS_ALLOW_ORIGINS", DefaultCORSAllowOrigins)
+	appendEnvWarning(warn)
 
 	SQLDSN = envRaw("SQL_DSN")
 	LogSQLDSN = envRaw("LOG_SQL_DSN")
 	RedisConnString = envRaw("REDIS_CONN_STRING")
 
-	NodeType = envStr("NODE_TYPE", DefaultNodeType)
+	// 先小写再比较：运维写成 NODE_TYPE=Slave 时，按原样比较会把从节点判成主节点，
+	// 从节点于是去跑迁移——这是"多节点同时建表"最直接的来源。
+	NodeType = strings.ToLower(envStr("NODE_TYPE", DefaultNodeType))
+	switch NodeType {
+	case "master", "slave":
+	default:
+		EnvWarnings = append(EnvWarnings, fmt.Sprintf(
+			"NODE_TYPE=%q 无法识别（只认 master/slave），按 %s 处理", NodeType, DefaultNodeType))
+		NodeType = DefaultNodeType
+	}
 	NodeName = envRaw("NODE_NAME")
 	IsMasterNode = NodeType != "slave"
 
-	SyncFrequency = envInt("SYNC_FREQUENCY", DefaultSyncFrequencySeconds)
+	SyncFrequency, warn = envInt("SYNC_FREQUENCY", DefaultSyncFrequencySeconds)
+	appendEnvWarning(warn)
 	if SyncFrequency < MinSyncFrequencySeconds {
 		EnvWarnings = append(EnvWarnings, fmt.Sprintf(
 			"SYNC_FREQUENCY=%d 低于下限 %d 秒，已抬到下限", SyncFrequency, MinSyncFrequencySeconds))
 		SyncFrequency = MinSyncFrequencySeconds
 	}
 
-	ShutdownTimeout = envInt("SHUTDOWN_TIMEOUT_SECONDS", DefaultShutdownTimeoutSeconds)
+	ShutdownTimeout, warn = envInt("SHUTDOWN_TIMEOUT_SECONDS", DefaultShutdownTimeoutSeconds)
+	appendEnvWarning(warn)
+	if ShutdownTimeout < MinShutdownTimeoutSeconds {
+		EnvWarnings = append(EnvWarnings, fmt.Sprintf(
+			"SHUTDOWN_TIMEOUT_SECONDS=%d 低于下限 %d 秒，已抬到下限",
+			ShutdownTimeout, MinShutdownTimeoutSeconds))
+		ShutdownTimeout = MinShutdownTimeoutSeconds
+	}
 	LogLevel = envStr("LOG_LEVEL", DefaultLogLevel)
 }
 
@@ -607,22 +793,46 @@ func envStr(key, def string) string {
 }
 
 // envInt 读取整数。非法值不致命：回退默认值继续启动——
-// 一个写错的端口不该让服务完全起不来，但也不该被静默接受成 0。
-func envInt(key string, def int) int {
+// 一个写错的端口不该让服务完全起不来，但也**不能静默**：
+// 回退必须留痕，否则 PORT=abc 会安安静静地跑在 3000 上，
+// 而运维以为服务听在他们配的端口上。第二个返回值是告警文本。
+func envInt(key string, def int) (value int, warn string) {
 	v := envRaw(key)
 	if v == "" {
-		return def
+		return def, ""
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		return def, fmt.Sprintf("%s=%q 不是整数，已回退默认值 %d", key, v, def)
 	}
-	return n
+	return n, ""
+}
+
+// appendEnvWarning 收集一条告警，空串表示无告警。
+func appendEnvWarning(w string) {
+	if w != "" {
+		EnvWarnings = append(EnvWarnings, w)
+	}
 }
 
 // envList 读取逗号分隔的列表，逐项去空白，空项丢弃。
-func envList(key, def string) []string {
-	raw := envStr(key, def)
+//
+// 它把"没配"和"配了但一个有效条目都没有"分开处理，这是安全语义上的区别：
+//
+//	没配（键不存在或为空） → 用默认值
+//	配了但全是空项（如 ","） → 空列表，并告警
+//
+// 后一种情况若回落到默认值，默认值里的 "*" 是"允许所有来源"，
+// 于是一次本想收紧的配置反而把 CORS 完全打开了。空列表是"谁都不允许"，
+// 属于失败时收紧（fail-closed）。
+//
+// 第二个返回值是给 InitEnv 收集的告警文本，空串表示无告警。
+func envList(key, def string) (values []string, warn string) {
+	raw := envRaw(key)
+	if raw == "" {
+		return strings.Split(def, ","), ""
+	}
+
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
@@ -631,13 +841,15 @@ func envList(key, def string) []string {
 		}
 	}
 	if len(out) == 0 {
-		return []string{def}
+		return []string{}, fmt.Sprintf(
+			"%s 已配置但没有有效条目，按空列表处理（不信任任何跨域来源）；"+
+				"要允许所有来源请显式写 *", key)
 	}
-	return out
+	return out, ""
 }
 ```
 
-`fmt` 是 `EnvWarnings` 那条 append 用到的，记得加进 import：
+import 块里已含 `fmt`（`EnvWarnings` 的那几条 `Sprintf` 都用它）：
 
 ```go
 import (
@@ -651,7 +863,7 @@ import (
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `go test ./internal/common/ -v`
-Expected: PASS，五个测试全通过。
+Expected: PASS，全部测试通过（默认值、覆盖、钳制告警、非法回退等各一组）。
 
 - [ ] **Step 6: Commit**
 
@@ -942,6 +1154,41 @@ func TestQuotaRoundCheckedNegativeUnderflows(t *testing.T) {
 	}
 }
 
+// -0.4 取整后是 -0，而 -0 < 0 为假：负数必须在取整前认出，
+// 否则 Round 档与 Float 档对同一个负数会给出相反结论。
+func TestQuotaRoundAgreesWithFloatFamilyOnNegativeFractions(t *testing.T) {
+	for _, f := range []float64{-0.4, -0.4999, -0.0001} {
+		wantV, wantClamp := QuotaFromFloatChecked(f)
+		gotV, gotClamp := QuotaRoundChecked(f)
+		if gotV != wantV || gotClamp != wantClamp {
+			t.Errorf("QuotaRoundChecked(%v) = (%d, %v)，而 QuotaFromFloatChecked(%v) = (%d, %v)",
+				f, gotV, gotClamp, f, wantV, wantClamp)
+		}
+		if _, err := QuotaRoundStrict(f); !errors.Is(err, ErrQuotaNegative) {
+			t.Errorf("QuotaRoundStrict(%v) 应报 ErrQuotaNegative，得到 %v", f, err)
+		}
+	}
+
+	// 精确的 0 与 -0 都不是负数，不该被当成下溢。
+	for _, f := range []float64{0, math.Copysign(0, -1)} {
+		if v, clamp := QuotaRoundChecked(f); v != 0 || clamp != ClampNone {
+			t.Errorf("QuotaRoundChecked(%v) = (%d, %v)，期望 (0, ClampNone)", f, v, clamp)
+		}
+	}
+}
+
+// decimal 档与浮点档对负数的判定也必须一致。
+func TestDecimalAgreesWithFloatFamilyOnNegativeFractions(t *testing.T) {
+	for _, s := range []string{"-0.4", "-0.0001"} {
+		if got, clamp := QuotaFromDecimalChecked(s); got != 0 || clamp != ClampUnderflow {
+			t.Errorf("QuotaFromDecimalChecked(%q) = (%d, %v)，期望 (0, ClampUnderflow)", s, got, clamp)
+		}
+	}
+	if got, clamp := QuotaFromDecimalChecked("-0"); got != 0 || clamp != ClampNone {
+		t.Errorf("QuotaFromDecimalChecked(\"-0\") = (%d, %v)，期望 (0, ClampNone)", got, clamp)
+	}
+}
+
 func TestQuotaFromDecimal(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -955,6 +1202,8 @@ func TestQuotaFromDecimal(t *testing.T) {
 		{"零", "0", 0, ClampNone},
 		{"负数", "-1", 0, ClampUnderflow},
 		{"超过上限", "99999999999999999999", MaxQuota, ClampOverflow},
+		{"负数（取整后为 0）", "-0.4", 0, ClampUnderflow},
+		{"负零", "-0", 0, ClampNone},
 		{"非数字", "abc", 0, ClampNaN},
 		{"空串", "", 0, ClampNaN},
 		{"前后空白", "  12.6  ", 13, ClampNone},
@@ -1103,6 +1352,13 @@ var (
 //	+Inf / > MaxQuota → MaxQuota + ClampOverflow
 //	-Inf / < 0        → 0        + ClampUnderflow
 //
+// 负号要在取整**之前**判断：math.Round(-0.4) 是 -0，而 Go 里 -0 < 0 为假，
+// 先取整会把"负数金额"当成正常值。三档（Float/Round/Decimal）对同一输入
+// 的判定必须一致，否则调用方换个入口就得到相反的结论。
+//
+// 另注：指数超出 decimal 解码上限的字符串（如 "1e1000000000"）在 decimal 档
+// 报 ClampNaN 而不是 ClampOverflow——值从未被成功解析出来，无从与上限比较。
+//
 // 为什么 NaN 不饱和到 MaxQuota：结算路径上那会给出荒谬的巨额扣费。
 // 饱和到 0 是"宁可少扣"，但正因为危险，所以必须返回标记让调用方显式处理
 // ——零 usage 绝不能当成免费。
@@ -1155,16 +1411,28 @@ func QuotaFromFloatStrict(f float64) (int, error) {
 // 分层计费必须用它：如果先算小数再截断，预扣与结算会差 ±1 quota，
 // 日志里天天出现"金额对不上"的噪声。
 func QuotaRound(f float64) int {
-	v, _ := clampQuota(math.Round(f))
+	v, _ := QuotaRoundChecked(f)
 	return v
 }
 
+// QuotaRoundChecked 与 QuotaFromFloatChecked 对同一输入的判定必须一致，
+// 所以先判符号再取整（-0.4 取整成 -0 会丢掉符号，详见 clampQuota 的说明）。
 func QuotaRoundChecked(f float64) (int, QuotaClamp) {
+	if math.IsNaN(f) {
+		return 0, ClampNaN
+	}
+	if f < 0 {
+		return 0, ClampUnderflow
+	}
 	return clampQuota(math.Round(f))
 }
 
 func QuotaRoundStrict(f float64) (int, error) {
-	return QuotaFromFloatStrict(math.Round(f))
+	v, clamp := QuotaRoundChecked(f)
+	if clamp.Saturated() {
+		return 0, clampError(clamp)
+	}
+	return v, nil
 }
 
 // QuotaFromDecimal 用 decimal 处理字符串价格，避免 "0.1" 这类值走 float 丢精度。
@@ -1187,7 +1455,11 @@ func QuotaFromDecimalChecked(s string) (int, QuotaClamp) {
 func QuotaFromDecimalStrict(s string) (int, error) {
 	d, err := decimal.NewFromString(strings.TrimSpace(s))
 	if err != nil {
-		return 0, fmt.Errorf("解析金额 %q 失败: %w", s, err)
+		// 包上 ErrQuotaNaN：Checked 档对同一输入给 ClampNaN、浮点 Strict 档给
+		// ErrQuotaNaN，唯独 strict 这一档拿不到统一的哨兵，调用方就没法用
+		// errors.Is 识别"这不是一个有效金额"。
+		// shopspring 没有导出解析错误变量，只能把原始错误以文本形式附上。
+		return 0, fmt.Errorf("%w：无法解析金额 %q（%v）", ErrQuotaNaN, s, err)
 	}
 	v, clamp := decimalToQuota(d)
 	if clamp.Saturated() {
@@ -1201,13 +1473,12 @@ func QuotaFromDecimalStrict(s string) (int, error) {
 // 注意这里全程不经过 float64：几十位的价格字符串转 float 就丢精度了，
 // 越界判断会变得不可靠。
 func decimalToQuota(d decimal.Decimal) (int, QuotaClamp) {
-	if d.IsZero() {
-		return 0, ClampNone
-	}
-	rounded := d.Round(0) // shopspring 的 Round 是 half away from zero
-	if rounded.IsNegative() {
+	// 负号在取整前判：d.Round(0) 会把 -0.4 变成 0，之后 IsNegative() 就为假了，
+	// 于是同一个负数在 decimal 档变成 ClampNone、在浮点档却是 ClampUnderflow。
+	if d.IsNegative() {
 		return 0, ClampUnderflow
 	}
+	rounded := d.Round(0) // shopspring 的 Round 是 half away from zero
 	if rounded.GreaterThan(decimal.NewFromInt(MaxQuota)) {
 		return MaxQuota, ClampOverflow
 	}
@@ -1303,6 +1574,29 @@ func TestLoggerBeforeSetupDoesNotPanic(t *testing.T) {
 		t.Fatal("Logger() 不应返回 nil")
 	}
 }
+
+// 钉住调用顺序契约：SetupLogger 会用 LOG_LEVEL 覆盖此前 SetLevel 设的值。
+//
+// 启动流程若把"读配置"放在 SetupLogger 之前，配置里的 log_level 就会被
+// 静默吃掉，现象是"改了日志级别没反应"而日志里毫无线索。这条测试让
+// 覆盖语义一旦变化就地报警，也说明为什么顺序不能反。
+func TestSetupLoggerOverridesEarlierSetLevel(t *testing.T) {
+	SetLevel(slog.LevelDebug)  // 假装配置域先跑了一步
+	SetupLogger("info", false) // 启动流程随后才建 logger
+
+	if Logger().Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("SetupLogger 应覆盖此前 SetLevel 设的级别（这正是顺序不能反的原因）")
+	}
+	if !Logger().Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("SetupLogger 之后应按 LOG_LEVEL 生效")
+	}
+
+	// SetupLogger 之后再 SetLevel，才是唯一有效的用法。
+	SetLevel(slog.LevelDebug)
+	if !Logger().Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("SetupLogger 之后的 SetLevel 应生效")
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1320,6 +1614,19 @@ Expected: FAIL — `undefined: ParseLevel`。
 // 日志级别可以在运行时更新（配置热更新的一条副作用），所以级别存在
 // atomic 里，由自定义的 slog.Leveler 在每次判断时读取——而不是在
 // SetupLogger 时把级别固化进 HandlerOptions。
+//
+// ★ 调用顺序：SetupLogger 必须在启动流程里**先于**任何 SetLevel 与任何配置读取。
+//
+// 原因是 SetupLogger 会用 LOG_LEVEL 重写级别。若配置域在 SetupLogger 之前
+// 就读到了 system_setting.log_level 并调了 SetLevel，那条设置会被随后的
+// SetupLogger 静默覆盖——现象是"改了日志级别没反应"，而日志里没有任何线索
+// 说明它被谁改回去了。启动流程的正确顺序是：
+//
+//	InitEnv → SetupLogger(LOG_LEVEL) → 读配置 → 之后才开始 SetLevel
+//
+// 在此之前调用 SetLevel 也不会报错（它只写一个 atomic），但那次设置
+// 对输出没有任何影响：Logger() 这时返回的是 slog 默认 logger，
+// 它按自己的级别过滤。
 package logger
 
 import (
@@ -1342,6 +1649,9 @@ func (dynamicLevel) Level() slog.Level { return slog.Level(level.Load()) }
 // SetupLogger 建初始 logger。level 来自环境变量 LOG_LEVEL，
 // 之后可由配置项 system_setting.log_level 覆盖。
 // jsonFormat 为 false 时输出便于人读的文本格式（本地开发）。
+//
+// **它会用 levelName 重写当前级别**，所以必须在读配置之前调用一次，
+// 且整个进程只调用一次。详见包注释里的调用顺序。
 func SetupLogger(levelName string, jsonFormat bool) {
 	level.Store(int32(ParseLevel(levelName)))
 
@@ -1356,6 +1666,8 @@ func SetupLogger(levelName string, jsonFormat bool) {
 }
 
 // SetLevel 运行时更新日志级别（配置热更新的副作用走这里）。
+//
+// 必须在 SetupLogger 之后调用：SetupLogger 会覆盖这里设的值。
 func SetLevel(lv slog.Level) { level.Store(int32(lv)) }
 
 // ParseLevel 解析 debug/info/warn/error，非法值回退 info。
@@ -1429,15 +1741,32 @@ Expected: `go.mod` 增加 `github.com/go-redis/redis/v8 v8.11.5`。
 package common
 
 import (
+	"context"
 	"errors"
 	"testing"
+
+	"github.com/go-redis/redis/v8"
 )
+
+// resetRedis 把 Redis 状态清成"未启用"。测试与实现同包，直接用未导出的变量，
+// 不为测试在生产代码里开后门。
+func resetRedis(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = CloseRedis()
+		RedisConnString = ""
+	})
+	_ = CloseRedis()
+}
 
 // Redis 未启用时，底层函数必须明确报错，而不是空指针崩掉或静默返回零值——
 // 静默返回零值会让上层"降级"变成"数据丢失"。
 func TestRedisFunctionsFailClearlyWhenDisabled(t *testing.T) {
-	RedisEnabled = false
-	RDB = nil
+	resetRedis(t)
+
+	if RedisEnabled() || LoadRedis() != nil {
+		t.Fatal("前置条件不成立：此刻句柄应为空")
+	}
 
 	if _, err := RedisGet("k"); !errors.Is(err, ErrRedisDisabled) {
 		t.Errorf("RedisGet 应返回 ErrRedisDisabled，得到 %v", err)
@@ -1454,33 +1783,64 @@ func TestRedisFunctionsFailClearlyWhenDisabled(t *testing.T) {
 }
 
 // 未配置 REDIS_CONN_STRING 时 InitRedisClient 必须安静降级，不能 panic、不能卡住。
+// 同时验证它会把上一轮的句柄**关掉**：否则反复 Init 会漏掉连接池。
 func TestInitRedisClientWithoutConfigDegrades(t *testing.T) {
-	RedisEnabled = true // 故意留下脏状态，验证 Init 会把它清掉
-	RedisConnString = ""
-	t.Cleanup(func() { RedisEnabled = false; RDB = nil })
+	t.Cleanup(func() { _ = CloseRedis(); RedisConnString = "" })
 
+	// 制造"上一轮已启用"的脏状态。这里的 client 从不真正连出去，
+	// 本用例只关心句柄有没有被摘掉、有没有被关闭。
+	stale := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	rdb.Store(stale)
+	redisEnabled.Store(true)
+
+	RedisConnString = ""
 	InitRedisClient()
 
-	if RedisEnabled {
+	if RedisEnabled() {
 		t.Error("未配置 REDIS_CONN_STRING 时 RedisEnabled 必须为 false")
 	}
-	if RDB != nil {
-		t.Error("未配置时不应建立连接")
+	if LoadRedis() != nil {
+		t.Error("未配置时不应留下 client")
+	}
+	if err := stale.Ping(context.Background()).Err(); err == nil {
+		t.Error("旧 client 必须被关闭，否则每次 Init 都漏一个连接池")
 	}
 }
 
 // 配置了一个连不上的地址：必须降级而不是启动失败——这是第二条验收标准。
 func TestInitRedisClientUnreachableDegrades(t *testing.T) {
-	RedisConnString = "127.0.0.1:1" // 保留端口，必然连不上
-	t.Cleanup(func() { RedisEnabled = false; RDB = nil; RedisConnString = "" })
+	t.Cleanup(func() { _ = CloseRedis(); RedisConnString = "" })
 
+	RedisConnString = "127.0.0.1:1" // 保留端口，必然连不上
 	InitRedisClient()
 
-	if RedisEnabled {
+	if RedisEnabled() {
 		t.Error("连接失败时 RedisEnabled 必须为 false")
 	}
-	if RDB != nil {
+	if LoadRedis() != nil {
 		t.Error("连接失败时不应留下 client")
+	}
+}
+
+// 关闭后状态必须一并清空：否则调用方拿到的是驱动层的 "client is closed"，
+// 一个没法用 errors.Is 识别的错误。Close 必须幂等。
+func TestCloseRedisClearsState(t *testing.T) {
+	t.Cleanup(func() { RedisConnString = "" })
+
+	rdb.Store(redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"}))
+	redisEnabled.Store(true)
+
+	if err := CloseRedis(); err != nil {
+		t.Errorf("CloseRedis 应成功，得到 %v", err)
+	}
+	if RedisEnabled() || LoadRedis() != nil {
+		t.Error("CloseRedis 之后必须报告未启用")
+	}
+	if _, err := RedisGet("k"); !errors.Is(err, ErrRedisDisabled) {
+		t.Errorf("关闭后应得到 ErrRedisDisabled，得到 %v", err)
+	}
+	if err := CloseRedis(); err != nil {
+		t.Errorf("CloseRedis 必须幂等，第二次调用报错 %v", err)
 	}
 }
 
@@ -1489,6 +1849,7 @@ func TestNormalizeRedisURL(t *testing.T) {
 		{"127.0.0.1:6379", "redis://127.0.0.1:6379"},
 		{"redis://127.0.0.1:6379", "redis://127.0.0.1:6379"},
 		{"rediss://host:6380", "rediss://host:6380"},
+		{"  127.0.0.1:6379  ", "redis://127.0.0.1:6379"},
 	}
 	for _, c := range cases {
 		if got := normalizeRedisURL(c.in); got != c.want {
@@ -1511,9 +1872,19 @@ import (
 	"github.com/yyyCode/whats-api/internal/common"
 )
 
+// useMemoryBackend 让 Counter 走内存路径。
+//
+// Counter 的判断依据是 common.RedisEnabled()，而 Redis 的开关状态是 common
+// 的内部状态，cachex 够不着——只能通过公共 API 把它关掉。CloseRedis 正是
+// 语义上最贴切的那个：关闭之后系统本来就该退化到内存。
+func useMemoryBackend(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() { _ = common.CloseRedis() })
+	_ = common.CloseRedis()
+}
+
 func TestCounterUsesMemoryBackendWhenRedisDisabled(t *testing.T) {
-	common.RedisEnabled = false
-	common.RDB = nil
+	useMemoryBackend(t)
 
 	c := NewCounter("test_requests", time.Minute)
 	if c.Backend() != "memory" {
@@ -1536,8 +1907,7 @@ func TestCounterUsesMemoryBackendWhenRedisDisabled(t *testing.T) {
 
 // 计数器必须是原子的：并发自增不能丢计数。
 func TestCounterIncrIsAtomic(t *testing.T) {
-	common.RedisEnabled = false
-	common.RDB = nil
+	useMemoryBackend(t)
 
 	c := NewCounter("test_concurrent", time.Minute)
 	const n = 100
@@ -1562,7 +1932,7 @@ func TestCounterIncrIsAtomic(t *testing.T) {
 
 // 不同 key 互不干扰。
 func TestCounterKeysAreIndependent(t *testing.T) {
-	common.RedisEnabled = false
+	useMemoryBackend(t)
 
 	c := NewCounter("test_keys", time.Minute)
 	if _, err := c.Incr("a"); err != nil {
@@ -1582,6 +1952,35 @@ func TestCounterKeysAreIndependent(t *testing.T) {
 		t.Errorf("b = %d，期望 1", v)
 	}
 }
+
+// TTL 是滑动窗口：每次自增都把过期时间往后推，与 Redis 的 INCR+EXPIRE 一致。
+func TestCounterTTLIsSlidingWindow(t *testing.T) {
+	useMemoryBackend(t)
+
+	const ttl = 400 * time.Millisecond
+	c := NewCounter("test_ttl", ttl)
+	if _, err := c.Incr("k"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 在第一次的 TTL 到期前再自增一次，把过期时间往后推。
+	time.Sleep(350 * time.Millisecond)
+	if _, err := c.Incr("k"); err != nil {
+		t.Fatal(err)
+	}
+
+	// t≈500ms：已越过"不滑动时"的 400ms 截止点，但第二次自增把窗口推到了 750ms。
+	// 留了 ±100ms 余量，避免机器负载高时误报。
+	time.Sleep(150 * time.Millisecond)
+	if v, ok := c.Get("k"); !ok || v != 2 {
+		t.Errorf("滑动窗口未生效：Get = (%d, %v)，期望 (2, true)", v, ok)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+	if _, ok := c.Get("k"); ok {
+		t.Error("TTL 到期后应过期")
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1598,6 +1997,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -1605,16 +2005,33 @@ import (
 	"github.com/yyyCode/whats-api/internal/logger"
 )
 
-// ErrRedisDisabled 表示 Redis 未启用（未配置，或配置了但连不上）。
+// ErrRedisDisabled 表示 Redis 未启用（没配置，或启动期就没连上）。
 // 调用方据此走进程内缓存——这正是"拿掉 Redis 也能启动"的实现方式。
+//
+// 注意它**不**覆盖「启动时正常、运行中掉线」：那种情况下 RedisGet/RedisIncr
+// 返回的是 redis 驱动的原始错误（连接失败等），不是这个哨兵。需要在运行期
+// 降级的调用方（如 cachex.Counter）应当对任何 error 都回退，而不是只认哨兵。
 var ErrRedisDisabled = errors.New("redis 未启用")
 
+// 句柄写成 atomic：可用性在每个请求上都被读到，而 Init/Close 是写方。
+// 万一将来加入运行期重连，普通变量的并发读写就是数据竞争（-race 会报），
+// 不是"读到旧值"这么轻。LoadRedis 一次 Load 同时判定可用性与取句柄，
+// 分两次读可能跨越一次重连，拿到"已判定可用但句柄已换"的错配。
 var (
-	// RedisEnabled 为 true 时 RDB 可用。所有使用方都必须先看这个标志。
-	RedisEnabled bool
-	// RDB 在未启用时为 nil。
-	RDB *redis.Client
+	redisEnabled atomic.Bool
+	rdb          atomic.Pointer[redis.Client]
 )
+
+// LoadRedis 返回当前客户端；未启用时返回 nil。
+func LoadRedis() *redis.Client {
+	if !redisEnabled.Load() {
+		return nil
+	}
+	return rdb.Load()
+}
+
+// RedisEnabled 报告是否有可用的客户端。
+func RedisEnabled() bool { return LoadRedis() != nil }
 
 // InitRedisClient 初始化 Redis。**非致命**：
 //
@@ -1623,10 +2040,11 @@ var (
 //
 // 两种失败都不阻断启动：缓存是加速手段，不该成为可用性的单点。
 func InitRedisClient() {
-	RedisEnabled = false
-	if RDB != nil {
-		_ = RDB.Close()
-		RDB = nil
+	// 先摘掉旧句柄再探测：探测期间 LoadRedis 返回 nil，调用方走进程内缓存，
+	// 不会拿到一个马上要被关掉的客户端。
+	redisEnabled.Store(false)
+	if old := rdb.Swap(nil); old != nil {
+		_ = old.Close()
 	}
 
 	if RedisConnString == "" {
@@ -1650,8 +2068,8 @@ func InitRedisClient() {
 		return
 	}
 
-	RDB = client
-	RedisEnabled = true
+	rdb.Store(client)
+	redisEnabled.Store(true)
 	logger.Info("Redis 已启用")
 }
 
@@ -1669,43 +2087,52 @@ func normalizeRedisURL(s string) string {
 // 这样"多节点最终一致"的窗口只有一个概念，而不是两个不同的时间常数。
 func RedisKeyCacheSeconds() int { return SyncFrequency }
 
+// CloseRedis 关闭客户端并清空句柄：关闭后 RedisEnabled() 返回 false，
+// 后续调用拿到的是 ErrRedisDisabled，而不是"client is closed"这种
+// 没法用 errors.Is 识别的驱动错误。
 func CloseRedis() error {
-	if RDB == nil {
+	redisEnabled.Store(false)
+	old := rdb.Swap(nil)
+	if old == nil {
 		return nil
 	}
-	return RDB.Close()
+	return old.Close()
 }
 
 func RedisGet(key string) (string, error) {
-	if !RedisEnabled || RDB == nil {
+	client := LoadRedis()
+	if client == nil {
 		return "", ErrRedisDisabled
 	}
-	return RDB.Get(context.Background(), key).Result()
+	return client.Get(context.Background(), key).Result()
 }
 
 // RedisSet 写入键值并设 TTL。ttl <= 0 表示不过期。
 func RedisSet(key, value string, ttl time.Duration) error {
-	if !RedisEnabled || RDB == nil {
+	client := LoadRedis()
+	if client == nil {
 		return ErrRedisDisabled
 	}
-	return RDB.Set(context.Background(), key, value, ttl).Err()
+	return client.Set(context.Background(), key, value, ttl).Err()
 }
 
 func RedisDel(key string) error {
-	if !RedisEnabled || RDB == nil {
+	client := LoadRedis()
+	if client == nil {
 		return ErrRedisDisabled
 	}
-	return RDB.Del(context.Background(), key).Err()
+	return client.Del(context.Background(), key).Err()
 }
 
 // RedisIncr 原子自增，并刷新 TTL（滑动窗口）。
 // 走 pipeline 是为了让 INCR 与 EXPIRE 一次往返完成，避免"自增了但没设过期"的中间态。
 func RedisIncr(key string, ttl time.Duration) (int64, error) {
-	if !RedisEnabled || RDB == nil {
+	client := LoadRedis()
+	if client == nil {
 		return 0, ErrRedisDisabled
 	}
 	ctx := context.Background()
-	pipe := RDB.TxPipeline()
+	pipe := client.TxPipeline()
 	incr := pipe.Incr(ctx, key)
 	if ttl > 0 {
 		pipe.Expire(ctx, key, ttl)
@@ -1753,11 +2180,15 @@ func NewCounter(namespace string, ttl time.Duration) *Counter {
 
 // useRedis 每次调用都重新判断，而不是在构造时固化：
 // Redis 中途掉线后代码应继续工作（降级），而不是整片报错。
-func (c *Counter) useRedis() bool { return common.RedisEnabled && common.RDB != nil }
+func (c *Counter) useRedis() bool { return common.RedisEnabled() }
 
 func (c *Counter) key(key string) string { return c.namespace + ":" + key }
 
-// Backend 报告当前实际后端，供 /api/status 与运维排查使用。
+// Backend 报告**选用**的后端，供 /api/status 与运维排查使用。
+//
+// 它反映的是配置与启动期探测的结果，不含运行期单次调用的成败：
+// 启动时连通、之后 Redis 掉线时它仍返回 "redis"，而 Incr/Get 已经在
+// 回落到内存。要判断"此刻 Redis 是否真在服务"，得看错误日志而不是这里。
 func (c *Counter) Backend() string {
 	if c.useRedis() {
 		return "redis"
@@ -1777,17 +2208,18 @@ func (c *Counter) Incr(key string) (int64, error) {
 }
 
 // Get 读取当前值。内存后端的 TTL 是滑动窗口（与 Redis 路径的 EXPIRE 语义一致）。
+//
+// Redis 出错时回落到内存，与 Incr 对称。不对称会造出一个很难查的现象：
+// 掉线期间 Incr 写进了内存，而 Get 去读 Redis 得到 miss，刚加上的计数
+// 立刻"不存在"，看日志还以为没写进去。
 func (c *Counter) Get(key string) (int64, bool) {
 	if c.useRedis() {
 		raw, err := common.RedisGet(c.key(key))
-		if err != nil {
-			return 0, false
+		if err == nil {
+			if v, perr := parseCounter(raw); perr == nil {
+				return v, true
+			}
 		}
-		v, err := parseCounter(raw)
-		if err != nil {
-			return 0, false
-		}
-		return v, true
 	}
 	return c.memory.Get(key)
 }
@@ -1901,6 +2333,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 package config
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -2157,6 +2590,32 @@ func TestRegisterPanicsOnMisuse(t *testing.T) {
 		{"OnRebuild 注册到不存在的模块", func() {
 			NewManager().OnRebuild("nope", func() {})
 		}},
+		// 模块名或 tag 里出现 '.'：key 用第一个点切分，带点的名字会让不同模块
+		// 撞进同一个 key。这种情况必须在注册期就拦下。
+		{"模块名含点", func() {
+			s := newTestSetting()
+			NewManager().Register("a.b", &s)
+		}},
+		{"json tag 含点", func() {
+			s := struct {
+				Level string `json:"a.b"`
+			}{}
+			NewManager().Register("x", &s)
+		}},
+		// NaN/±Inf 编不出 JSON：MustMarshalString 会返回空串，于是 Option 表的
+		// 默认值里出现一个不是 JSON 的 ""，等别处解析才报错。
+		{"浮点默认值是 NaN", func() {
+			s := struct {
+				F float64 `json:"f"`
+			}{F: math.NaN()}
+			NewManager().Register("x", &s)
+		}},
+		{"浮点默认值是正无穷", func() {
+			s := struct {
+				F float64 `json:"f"`
+			}{F: math.Inf(1)}
+			NewManager().Register("x", &s)
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -2168,6 +2627,53 @@ func TestRegisterPanicsOnMisuse(t *testing.T) {
 			c.fn()
 		})
 	}
+}
+
+// json:"-" 是 Go 里"明确排除该字段"的写法，不是漏写 tag：它是合法意图，
+// 不该 panic，也不该出现在配置项里。
+func TestRegisterSkipsExplicitlyExcludedFields(t *testing.T) {
+	m := NewManager()
+	s := struct {
+		Level  string `json:"level"`
+		Secret string `json:"-"`
+		hidden string // 未导出字段同样不参与配置
+	}{Level: "info", Secret: "s3cr3t"}
+
+	m.Register("mod", &s)
+
+	got := m.ExportAllConfigs()
+	if _, ok := got["mod.secret"]; ok {
+		t.Error(`json:"-" 的字段不该出现在配置里`)
+	}
+	if got["mod.level"] != `"info"` {
+		t.Errorf(`ExportAllConfigs()["mod.level"] = %q，期望 "info"`, got["mod.level"])
+	}
+	if n := m.FieldCount(); n != 1 {
+		t.Errorf("FieldCount() = %d，期望 1", n)
+	}
+}
+
+// 匿名结构体的 reflect.Type.Name() 是空串。报错信息里不能出现「字段 .B」
+// 这种指不出是哪个模块的写法——注册期 panic 是给人看的，得能定位。
+func TestRegisterErrorNamesAnonymousStructReadably(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("应该 panic")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("panic 值应为 string，得到 %T", r)
+		}
+		if strings.Contains(msg, "字段 .") {
+			t.Errorf("报错信息里没有结构体名，定位不到模块：%s", msg)
+		}
+		if !strings.Contains(msg, "Level") {
+			t.Errorf("报错信息应指出是哪个字段：%s", msg)
+		}
+	}()
+	s := struct{ Level string }{}
+	NewManager().Register("x", &s)
 }
 
 // 多个模块各自的 key 不能互相污染。
@@ -2246,6 +2752,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -2253,6 +2760,15 @@ import (
 
 	"github.com/yyyCode/whats-api/internal/common"
 )
+
+// typeLabel 给匿名结构体一个可读的名字：elem.Type().Name() 对它返回空串，
+// 报错信息就成了「字段 .B」，看不出是哪个模块出的问题。
+func typeLabel(t reflect.Type) string {
+	if n := t.Name(); n != "" {
+		return n
+	}
+	return t.String()
+}
 
 // 支持的字段类型（M0）。扩展这里的同时要扩展 setField 与 encodeField。
 var supportedKinds = map[reflect.Kind]bool{
@@ -2297,6 +2813,11 @@ func (m *Manager) Register(name string, cfg any) {
 		panic("config: 模块名不能为空")
 	}
 
+	if strings.Contains(name, ".") {
+		panic(fmt.Sprintf("config: 模块名 %q 不能含 '.'——配置 key 是「模块名.json tag」，"+
+			"名字里的点会让 key 拆不开，不同模块会撞进同一个 key", name))
+	}
+
 	rv := reflect.ValueOf(cfg)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		panic(fmt.Sprintf("config: Register(%q) 需要非 nil 的结构体指针，得到 %T", name, cfg))
@@ -2313,11 +2834,21 @@ func (m *Manager) Register(name string, cfg any) {
 			continue // 未导出字段不参与配置（也不报错：它可能只是内部状态）
 		}
 
-		jsonName := strings.Split(sf.Tag.Get("json"), ",")[0]
-		if jsonName == "" || jsonName == "-" {
+		rawTag := sf.Tag.Get("json")
+		// json:"-" 是 Go 里"明确排除该字段"的写法（json:"-," 才是名为 "-" 的字段），
+		// 不是漏写 tag，所以按未导出字段同样跳过而不是报错。
+		if rawTag == "-" {
+			continue
+		}
+		jsonName := strings.Split(rawTag, ",")[0]
+		if jsonName == "" {
 			panic(fmt.Sprintf("config: 模块 %q 的字段 %s.%s 缺少 json tag——"+
 				"配置 key 由「模块名.json tag」生成，缺 tag 会让持久化 key 漂移",
-				name, elem.Type().Name(), sf.Name))
+				name, typeLabel(elem.Type()), sf.Name))
+		}
+		if strings.Contains(jsonName, ".") {
+			panic(fmt.Sprintf("config: 模块 %q 的 json tag %q 不能含 '.'——"+
+				"它就是 key 的分隔符", name, jsonName))
 		}
 		if _, dup := fields[jsonName]; dup {
 			panic(fmt.Sprintf("config: 模块 %q 的 json tag %q 重复", name, jsonName))
@@ -2325,6 +2856,15 @@ func (m *Manager) Register(name string, cfg any) {
 		if !supportedKinds[sf.Type.Kind()] {
 			panic(fmt.Sprintf("config: 模块 %q 的字段 %s 类型 %s 不支持"+
 				"（M0 支持 string/bool/int/int64/float64）", name, sf.Name, sf.Type.Kind()))
+		}
+		// 非有限的浮点默认值必须在注册期就炸：json.Marshal 编不出 NaN/±Inf，
+		// MustMarshalString 会返回空串，于是 ExportAllConfigs（Option 表默认值的
+		// 来源）里出现一个不是 JSON 的 ""，等别处解析才报错，现场已经远离原因。
+		if sf.Type.Kind() == reflect.Float64 {
+			if f := elem.Field(i).Float(); math.IsNaN(f) || math.IsInf(f, 0) {
+				panic(fmt.Sprintf("config: 模块 %q 的字段 %s 默认值是 %v，无法序列化成 JSON"+
+					"（NaN/±Inf 不是合法 JSON 数值）", name, sf.Name, f))
+			}
 		}
 		fields[jsonName] = field{jsonName: jsonName, index: i}
 	}
@@ -2882,7 +3422,8 @@ Expected: 三条命令全部通过，零输出错误。
 - [ ] **Step 3: 检查 go.mod 的 go directive**
 
 Run: `head -5 go.mod`
-Expected: 包含 `go 1.23`（或 1.23.x）。若 `go mod tidy` 把它抬高了，手工改回 `go 1.23` 并重跑 Step 2。
+Expected: 包含 `go 1.23.0`（工具链可以是 `toolchain go1.23.2`）。若 `go mod tidy` 把 `go` 行抬高了，
+手工改回 `go 1.23.0` 并重跑 Step 2。
 
 - [ ] **Step 4: Commit**
 
@@ -2901,7 +3442,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 □ go build ./...      通过
 □ go vet ./...        通过
 □ go test -race ./... 全绿
-□ internal/logger、internal/constant 不依赖本项目其他包；internal/common 只依赖这两个叶子
+□ internal/logger 与 internal/constant 不依赖本项目其他包；internal/common 只依赖 internal/logger
+  （internal/constant 是给 model 层用的持久化枚举，common 不引用它）
 □ 配置项的默认值可由 config.GlobalConfig.ExportAllConfigs() 导出
 □ 改一个配置项，system_setting.Get() 立即返回新快照（且旧快照未被就地修改）
 □ Redis 未配置/连不上时 counter.Backend() == "memory"
