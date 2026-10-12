@@ -4,13 +4,29 @@ import (
 	"database/sql"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/yyyCode/whats-api/internal/common"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
+
+// restoreEnvGlobals 让本包测试不受 common 包级全局残留的影响。
+//
+// t.Setenv 只还原进程环境变量，**不会**还原 common.InitEnv() 写下的包级全局
+// （IsMasterNode / SQLDSN / NodeType …）。一个设了 NODE_TYPE=slave 的测试
+// 会把 IsMasterNode 留成 false，而 CheckSetup/Migrate 在非 master 下静默 no-op——
+// 于是后续测试的失败取决于执行顺序，很难看出来。
+//
+// ★ 必须在任何 t.Setenv 之前调用：t.Cleanup 是 LIFO，先注册的这个回调因此最后执行，
+// 那时环境变量已被 t.Setenv 还原，再跑一次 InitEnv 就把全局重新对齐到进程初始状态。
+func restoreEnvGlobals(t *testing.T) {
+	t.Helper()
+	t.Cleanup(common.InitEnv)
+}
 
 // withTestDB 用临时目录里的真实 SQLite 文件建立主库与日志库，
 // 而不是内存库：迁移幂等、WAL、多进程共享这些行为都只有真实文件才测得到。
@@ -20,6 +36,7 @@ import (
 // 于是 t.TempDir 的清理在 Windows 上直接报 "being used by another process"。
 func withTestDB(t *testing.T) {
 	t.Helper()
+	restoreEnvGlobals(t)
 
 	dir := t.TempDir()
 	t.Setenv("SQL_DSN", "local:"+filepath.Join(dir, "test.db"))
@@ -226,6 +243,8 @@ func TestLockForUpdateRendersForUpdateOnServers(t *testing.T) {
 }
 
 func TestDSNKindDoesNotLeakDSN(t *testing.T) {
+	restoreEnvGlobals(t)
+
 	cases := []struct {
 		dsn  string
 		want string
@@ -269,6 +288,8 @@ func TestChooseDBErrorDoesNotLeakPassword(t *testing.T) {
 // 重复 InitDB 不能把上一个连接池留成孤儿：旧池必须被关掉。
 // "已关闭"是可观测的——先抓住旧句柄，第二次 Init 之后 Ping 它会失败。
 func TestInitDBClosesPreviousHandle(t *testing.T) {
+	restoreEnvGlobals(t)
+
 	dir := t.TempDir()
 	t.Setenv("LOG_SQL_DSN", "")
 	t.Cleanup(func() {
@@ -301,5 +322,198 @@ func TestInitDBClosesPreviousHandle(t *testing.T) {
 	}
 	if !PingMain() {
 		t.Errorf("第二次 InitDB 之后新主库应可用")
+	}
+}
+
+// 主库该有的表一张不少，logs 必须落在日志库——这是 08 篇"日志库分离"的接缝，
+// M0 就把 logs 放进日志库，等于当下就验证了这条接缝是通的。
+func TestLogsLiveInSeparateLogDB(t *testing.T) {
+	restoreEnvGlobals(t)
+
+	dir := t.TempDir()
+	t.Setenv("SQL_DSN", "local:"+filepath.Join(dir, "main.db"))
+	t.Setenv("LOG_SQL_DSN", "local:"+filepath.Join(dir, "log.db"))
+	t.Setenv("NODE_TYPE", "master")
+	common.InitEnv()
+	t.Cleanup(func() { _ = CloseDB(); OptionMap = map[string]string{} })
+
+	if err := InitDB(); err != nil {
+		t.Fatalf("InitDB 失败: %v", err)
+	}
+	if err := InitLogDB(); err != nil {
+		t.Fatalf("InitLogDB 失败: %v", err)
+	}
+
+	if LOG_DB == DB {
+		t.Fatal("配置了独立 LOG_SQL_DSN 时不该复用主库连接")
+	}
+	if !LogDBSeparate() {
+		t.Error("LogDBSeparate() 应为 true")
+	}
+	if !LOG_DB.Migrator().HasTable("logs") {
+		t.Error("logs 表应建在日志库")
+	}
+	if DB.Migrator().HasTable("logs") {
+		t.Error("logs 表不该出现在主库")
+	}
+	for _, table := range []string{"users", "tokens", "channels", "abilities", "options", "setup"} {
+		if !DB.Migrator().HasTable(table) {
+			t.Errorf("主库缺少表 %q", table)
+		}
+	}
+	if LOG_DB.Migrator().HasTable("users") {
+		t.Error("业务表不该建在日志库")
+	}
+}
+
+// 迁移幂等：连续三次启动不能有任何副作用（第八条上线验收清单里的那一条）。
+func TestMigrateIsIdempotentAcrossRestarts(t *testing.T) {
+	withTestDB(t) // 第一次迁移已经在 InitDB/InitLogDB 里跑过了
+
+	for i := 2; i <= 3; i++ {
+		if err := Migrate(); err != nil {
+			t.Fatalf("第 %d 次主库迁移失败: %v", i, err)
+		}
+		if err := migrateLOGDB(); err != nil {
+			t.Fatalf("第 %d 次日志库迁移失败: %v", i, err)
+		}
+		if err := CheckSetup(); err != nil {
+			t.Fatalf("第 %d 次 CheckSetup 失败: %v", i, err)
+		}
+	}
+
+	var count int64
+	if err := DB.Model(&Setup{}).Count(&count).Error; err != nil {
+		t.Fatalf("统计 setup 行数失败: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("setup 表应恰好 1 行，得到 %d 行", count)
+	}
+}
+
+// slave 节点不建表：多实例同时 AutoMigrate 只会互相抢锁。
+func TestSlaveSkipsMigration(t *testing.T) {
+	restoreEnvGlobals(t)
+
+	dir := t.TempDir()
+	t.Setenv("SQL_DSN", "local:"+filepath.Join(dir, "slave.db"))
+	t.Setenv("LOG_SQL_DSN", "")
+	t.Setenv("NODE_TYPE", "slave")
+	common.InitEnv()
+	t.Cleanup(func() { _ = CloseDB(); OptionMap = map[string]string{} })
+
+	if err := InitDB(); err != nil {
+		t.Fatalf("slave 节点 InitDB 不该失败: %v", err)
+	}
+	if err := InitLogDB(); err != nil {
+		t.Fatalf("slave 节点 InitLogDB 不该失败: %v", err)
+	}
+
+	for _, table := range []string{"users", "tokens", "channels", "abilities", "options", "setup", "logs"} {
+		if DB.Migrator().HasTable(table) {
+			t.Errorf("slave 节点不该建表，但 %q 存在", table)
+		}
+	}
+}
+
+// setup 首次写入恰好一行，重复调用不改动已有行。
+func TestCheckSetupWritesExactlyOnce(t *testing.T) {
+	withTestDB(t)
+
+	if err := CheckSetup(); err != nil {
+		t.Fatalf("CheckSetup 失败: %v", err)
+	}
+	var first Setup
+	if err := DB.First(&first, 1).Error; err != nil {
+		t.Fatalf("setup 首行不存在: %v", err)
+	}
+	if first.Version != common.Version {
+		t.Errorf("版本 = %q，期望 %q", first.Version, common.Version)
+	}
+	if first.InitializedAt <= 0 {
+		t.Errorf("初始化时间戳应为正数，得到 %d", first.InitializedAt)
+	}
+
+	if err := CheckSetup(); err != nil {
+		t.Fatalf("第二次 CheckSetup 失败: %v", err)
+	}
+	var second Setup
+	if err := DB.First(&second, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if second.InitializedAt != first.InitializedAt {
+		t.Error("已存在时不该改写 setup 行（否则每次重启都显得像首次安装）")
+	}
+
+	done, err := SetupComplete()
+	if err != nil || !done {
+		t.Errorf("SetupComplete() = (%v, %v)，期望 (true, nil)", done, err)
+	}
+}
+
+// 列名是 ABI 的一部分：写错列名会让将来的数据迁移对不上。
+// 这条测试同时钉住"不自行扩列"与"不用 GORM 软删除"。
+func TestSchemaMatchesBlueprint(t *testing.T) {
+	withTestDB(t)
+
+	mainModels := []struct {
+		model   any
+		columns []string
+	}{
+		{&User{}, []string{"id", "username", "password_hash", "role", "status",
+			"quota", "used_quota", "group_name", "email", "auth_version", "created_at"}},
+		{&Token{}, []string{"id", "user_id", "key", "status", "expired_time", "remain_quota",
+			"unlimited_quota", "model_limits_enabled", "model_limits", "allow_ips",
+			"used_quota", "group_name", "accessed_at", "created_at"}},
+		{&Channel{}, []string{"id", "type", "key", "base_url", "models", "group_name",
+			"priority", "weight", "tag", "status", "model_mapping", "param_override",
+			"header_override", "setting", "created_at"}},
+		{&Ability{}, []string{"group_name", "model_name", "channel_id", "enabled",
+			"priority", "weight", "tag"}},
+		{&Option{}, []string{"key", "value"}},
+		{&Setup{}, []string{"id", "version", "initialized_at"}},
+	}
+
+	for _, c := range mainModels {
+		for _, col := range c.columns {
+			if !DB.Migrator().HasColumn(c.model, col) {
+				t.Errorf("%T 缺少列 %q", c.model, col)
+			}
+		}
+		if DB.Migrator().HasColumn(c.model, "deleted_at") {
+			t.Errorf("%T 出现了 deleted_at：本项目不用 GORM 软删除（账本只追加）", c.model)
+		}
+	}
+
+	logColumns := []string{"id", "user_id", "type", "content", "model_name", "quota",
+		"prompt_tokens", "completion_tokens", "use_time", "is_stream", "channel_id",
+		"group_name", "token_name", "ip", "request_id", "other", "created_at"}
+	for _, col := range logColumns {
+		if !LOG_DB.Migrator().HasColumn(&Log{}, col) {
+			t.Errorf("logs 缺少列 %q", col)
+		}
+	}
+
+	// abilities 的复合主键是这张表存在的全部意义：一行 = (分组, 模型, 渠道)。
+	//
+	// 注：GORM v2 的 Migrator 接口没有 PrimaryKeys（计划里写的那条 API 不存在），
+	// 所以这里用 schema.Parse 读出模型的复合主键列。
+	sch, err := schema.Parse(&Ability{}, &sync.Map{}, schema.NamingStrategy{})
+	if err != nil {
+		t.Fatalf("解析 abilities schema 失败: %v", err)
+	}
+	got := map[string]bool{}
+	for _, k := range sch.PrimaryFieldDBNames {
+		got[k] = true
+	}
+	for _, want := range []string{"group_name", "model_name", "channel_id"} {
+		if !got[want] {
+			t.Errorf("abilities 复合主键缺少 %q（实际 %v）", want, sch.PrimaryFieldDBNames)
+		}
+	}
+
+	// setup 的表名是单数，不跟 GORM 的复数化。
+	if !DB.Migrator().HasTable("setup") {
+		t.Error("setup 表名应为单数 setup")
 	}
 }

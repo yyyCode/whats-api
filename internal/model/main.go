@@ -368,13 +368,46 @@ func DSNKind() string {
 	}
 }
 
-// TODO(Task 2): 这一节是让 Task 1 的测试能编译的临时桩，Task 2 会被真实实现替换。
-var OptionMap = map[string]string{}
+// ---------- 迁移 ----------
 
-func Migrate() error      { return nil }
-func migrateLOGDB() error { return nil }
+// mainModels 是主库要建的表。
+//
+// logs 不在这里：它走日志库（见 migrateLOGDB），这是"日志与业务分库"的接缝。
+func mainModels() []any {
+	return []any{&User{}, &Token{}, &Channel{}, &Ability{}, &Option{}, &Setup{}}
+}
 
-type Option struct {
-	Key   string `gorm:"column:key;primaryKey;size:128"`
-	Value string `gorm:"type:text"`
+// Migrate 执行主库迁移。只在 master 节点执行：
+// 多实例同时 AutoMigrate 只会互相抢锁与超时，没有任何好处。
+func Migrate() error {
+	if !common.IsMasterNode {
+		logger.Info("非 master 节点，跳过主库迁移", "node_type", common.NodeType)
+		return nil
+	}
+	if DB == nil {
+		return errors.New("主库未初始化")
+	}
+
+	logger.Info("开始主库迁移", "tables", len(mainModels()))
+	if err := DB.AutoMigrate(mainModels()...); err != nil {
+		return fmt.Errorf("主库 AutoMigrate 失败: %w", err)
+	}
+	logger.Info("主库迁移完成")
+	return nil
+}
+
+// migrateLOGDB 迁移日志库。LOG_SQL_DSN 为空时 LOG_DB == DB，
+// 等于把 logs 建在主库里——单机部署的合理简化。
+func migrateLOGDB() error {
+	if !common.IsMasterNode {
+		return nil
+	}
+	if LOG_DB == nil {
+		return errors.New("日志库未初始化")
+	}
+
+	if err := LOG_DB.AutoMigrate(&Log{}); err != nil {
+		return fmt.Errorf("日志库 AutoMigrate 失败: %w", err)
+	}
+	return nil
 }
