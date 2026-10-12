@@ -84,6 +84,11 @@ wait_status() {
 
 # start_server <dir> [ENV=V ...] → 输出 pid
 # 用 exec 让子 shell 被 env/二进制替换，于是 $! 就是二进制的 pid，kill 才有效。
+#
+# ★ 数据库一律用**相对**文件名（local:whats-api.db）而不是 $dir 拼出来的绝对路径：
+# Git Bash 的 mktemp / $WORK 是 MSYS 路径（/tmp/...），把它交给原生 Windows 二进制
+# 会被当成不存在的路径，SQLite 报 "unable to open database file"——
+# 而这里子 shell 已经 cd 进了 $dir，相对路径对所有平台都成立。
 start_server() {
   local dir="$1"
   shift
@@ -171,7 +176,7 @@ echo "② 拿掉 Redis 也能启动（降级为内存缓存）"
 D2="$WORK/t2"
 mkdir -p "$D2"
 # 故意配一个不可达的地址（端口 1 保留且无监听）：必须启动成功且降级。
-PID2="$(start_server "$D2" "PORT=3001" "REDIS_CONN_STRING=127.0.0.1:1" "SQL_DSN=local:$D2/whats-api.db")"
+PID2="$(start_server "$D2" "PORT=3001" "REDIS_CONN_STRING=127.0.0.1:1" "SQL_DSN=local:whats-api.db")"
 PIDS+=("$PID2")
 
 if BODY2="$(wait_status 3001 25)"; then
@@ -203,7 +208,7 @@ echo
 echo "③ 改配置：单实例立即生效 + 多实例 SYNC_FREQUENCY 内收敛"
 D3="$WORK/t3"
 mkdir -p "$D3"
-SHARED_DB="local:$D3/shared.db"
+SHARED_DB="local:shared.db"
 MSG="脚本改的-$$"
 
 PID3A="$(start_server "$D3" "PORT=3002" "SQL_DSN=$SHARED_DB" "SYNC_FREQUENCY=5" "NODE_NAME=node-a" "LOG_LEVEL=info")"
@@ -221,8 +226,10 @@ else
 
   BEFORE_B="$(json_get "$BODY_B" status_message)"
 
-  # ★ 从进程外改配置：这正是"多实例同步"与"改内存"的区别所在
-  if env "SQL_DSN=$SHARED_DB" "$OPTCTL" set system_setting.status_message "\"$MSG\"" >"$WORK/optctl.log" 2>&1; then
+  # ★ 从进程外改配置：这正是"多实例同步"与"改内存"的区别所在。
+  # SHARED_DB 是相对路径，所以 optctl 必须和两个实例在同一个工作目录里跑——
+  # 否则它会连到另一个（或新建一个）库，测试就成了"自己写自己读"的假通过。
+  if ( cd "$D3" && env "SQL_DSN=$SHARED_DB" "$OPTCTL" set system_setting.status_message "\"$MSG\"" ) >"$WORK/optctl.log" 2>&1; then
     pass "③ optctl 从进程外写入配置成功"
   else
     fail "③ optctl 写入失败（见 $WORK/optctl.log）"
@@ -265,7 +272,7 @@ if is_windows; then
 else
   D4="$WORK/t4"
   mkdir -p "$D4"
-  PID4="$(start_server "$D4" "PORT=3004" "SQL_DSN=local:$D4/whats-api.db")"
+  PID4="$(start_server "$D4" "PORT=3004" "SQL_DSN=local:whats-api.db")"
   if wait_status 3004 25 >/dev/null; then
     kill -TERM "$PID4"
     # 给足时间：停机超时默认 120 秒，但正常情况下应当秒级返回
