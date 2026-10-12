@@ -1,6 +1,6 @@
 // Package common 是基础设施层：启动期常量、JSON 编解码、数值安全、Redis 封装。
 //
-// 它不 import 本项目的任何其他包，是全项目的最底层。
+// 它只依赖 internal/logger 与 internal/constant——两个只依赖标准库的叶子包。
 package common
 
 // Version 出现在启动日志、/api/status 与响应头 X-Whats-Api-Version。

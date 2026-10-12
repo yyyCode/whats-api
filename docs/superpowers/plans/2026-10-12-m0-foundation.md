@@ -503,7 +503,7 @@ Expected: FAIL — `undefined: InitEnv` 等编译错误。
 ```go
 // Package common 是基础设施层：启动期常量、JSON 编解码、数值安全、Redis 封装。
 //
-// 它不 import 本项目的任何其他包，是全项目的最底层。
+// 它只依赖 internal/logger 与 internal/constant——两个只依赖标准库的叶子包。
 package common
 
 // Version 出现在启动日志、/api/status 与响应头 X-Whats-Api-Version。
@@ -2819,7 +2819,8 @@ Expected: 全绿。
 - [ ] **Step 5: 确认依赖方向没被破坏**
 
 Run: `go list -deps ./internal/common/ | grep whats-api`
-Expected: 只出现 `internal/common`（`common` 不依赖本项目任何其他包）。
+Expected: `internal/common`、`internal/logger`。
+`common` 只允许依赖 logger/constant 这两个叶子，出现 `setting`、`cachex`、`model` 等上层包就是成环了。
 
 Run: `go list -deps ./internal/setting/config/ | grep whats-api`
 Expected: `internal/common`、`internal/setting/config`。
@@ -2879,7 +2880,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 □ go build ./...      通过
 □ go vet ./...        通过
 □ go test -race ./... 全绿
-□ internal/common、internal/logger、internal/constant 不依赖本项目其他包
+□ internal/logger、internal/constant 不依赖本项目其他包；internal/common 只依赖这两个叶子
 □ 配置项的默认值可由 config.GlobalConfig.ExportAllConfigs() 导出
 □ 改一个配置项，system_setting.Get() 立即返回新快照（且旧快照未被就地修改）
 □ Redis 未配置/连不上时 counter.Backend() == "memory"
