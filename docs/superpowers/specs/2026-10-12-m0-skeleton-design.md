@@ -103,11 +103,16 @@ whats-api/
 **依赖方向（自上而下，同层不互相依赖）**：
 
 ```
-app → router → controller → { middleware, model } → { setting/config, cachex } → { common, logger, constant }
+app → router → controller → { middleware, model } → { setting/config, cachex } → { common, constant }
+
+logger：横切工具，只依赖标准库，任何层都可以 import（包括 common）
 ```
 
-- 即：`common`、`logger`、`constant` 不 import 本项目其他包；`setting` 与 `cachex` 只依赖 `common`/`logger`；
-  `model` 依赖 `setting/config` 与 `common`；`middleware` 依赖 `setting` 与 `logger`；`controller` 依赖 `model`。
+- 即：`logger`、`constant` 不 import 本项目其他包（叶子）；`common` 只依赖这两个叶子
+  （Redis 初始化期连不上要立刻告警，那一步 logger 已经就绪；`InitEnv` 之所以只能攒 `EnvWarnings`，
+  是因为它跑在 logger 之前）；`setting` 与 `cachex` 只依赖 `common`/`logger`；
+  `model` 依赖 `setting/config`、`constant` 与 `common`；`middleware` 依赖 `setting` 与 `logger`；
+  `controller` 依赖 `model`。
 - `middleware` 不 import `controller`；`controller` 不 import `router`。
 - `setting/config` 与 `setting/*_setting` 不 import `model`（避免与 `model/option.go` 成环）：
   DB 的读写由 `model/option.go` 发起，配置域只提供 schema 与快照。
