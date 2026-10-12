@@ -32,14 +32,21 @@ controller/          一个 /api/status 探活接口
 | 不做 | 归属 |
 |---|---|
 | `/v1` 任何 relay 端点、`middleware/auth.go`、`middleware/distributor.go` | M1 |
-| 计费预扣/结算/退款、账本表 | M2 |
+| 计费预扣/结算/退款、消费日志的**写入**（表结构 M0 已建） | M2 |
 | 管理面写接口（改渠道、改令牌、改配置的 HTTP 端点）、鉴权、前端 | M3 |
-| Ability 索引表、优先级加权随机、渠道健康管理 | M4 |
+| Ability 索引的**重建与消费**、优先级加权随机、渠道健康管理（表结构 M0 已建） | M4 |
 | 系统任务框架、Prometheus/pprof 暴露、审计日志 | M5 |
 | 协议互转（RelayKit）、表达式定价、JS 插件 | M6（按需） |
 
-**M0 只建 M0 真正读写的两张表**：`options`、`setup`。user / token / channel / ability / log
-等到使用它们的里程碑再加——`AutoMigrate` 加表幂等，提前建是纯负债。
+**M0 一次建齐核心表结构**（决策记录）：主库 `users` / `tokens` / `channels` / `abilities` / `options` / `setup`，
+日志库 `logs`。理由是表结构与其消费逻辑不同——**结构一改就要写定向迁移，而加表/加列是幂等的**，
+所以把"形状"提前定死更便宜。约束：
+
+- 字段**以 `11-blueprint.md` §4 的最小 DDL 骨架为准，不自行扩列**（不引入那里没有的字段）；
+- 模型在 M0 **只有 struct 定义，没有任何 CRUD / 查询层 / 缓存**；写路径随各自的里程碑进来
+  （users/tokens/channels 在 M3，abilities 在 M4，logs 在 M2）；
+- 表里的持久化枚举（`channels.type`、`logs.type`、`status`、`role`）是 **ABI：只增不改**，
+  数值在 `internal/constant` 集中定义并用测试钉住（见 §5.5）。
 
 **明确不做的事**：不引入 `relaykit` / `tokenkit` 独立 module（M0 没有协议转换与 token 计数）。
 
@@ -61,6 +68,7 @@ whats-api/
 ├── docs/superpowers/specs/       设计与实施文档
 └── internal/
     ├── app/app.go                Run(ctx)：启动时序 + HTTP 生命周期 + 优雅停机
+    ├── constant/constants.go     持久化枚举（role/status/log type…）：ABI，只增不改
     ├── common/
     │   ├── constants.go          版本号、默认端口、缓存 namespace 前缀
     │   ├── env.go                InitEnv()：环境变量 → 启动期常量
@@ -74,7 +82,12 @@ whats-api/
     │   ├── config/config.go      ConfigManager：Register / ExportAllConfigs / UpdateConfig / OnRebuild
     │   └── system_setting/       第一个配置域（含原子快照 Get()）
     ├── model/
-    │   ├── main.go               DB / LOG_DB、chooseDB、Migrate、lockForUpdate、方言常量
+    │   ├── main.go               DB / LOG_DB、chooseDB、Migrate、migrateLOGDB、lockForUpdate、方言 helper
+    │   ├── user.go               User
+    │   ├── token.go              Token
+    │   ├── channel.go            Channel
+    │   ├── ability.go            Ability（复合主键）
+    │   ├── log.go                Log（落在 LOG_DB）
     │   ├── option.go             Option / InitOptionMap / UpdateOption / updateOptionMap / SyncOptions
     │   └── setup.go              Setup / CheckSetup
     ├── middleware/               recovery.go request-id.go version.go route-tag.go logger.go cors.go
@@ -91,10 +104,10 @@ whats-api/
 **依赖方向（自上而下，同层不互相依赖）**：
 
 ```
-app → router → controller → { middleware, model } → { setting/config, cachex } → { common, logger }
+app → router → controller → { middleware, model } → { setting/config, cachex } → { common, logger, constant }
 ```
 
-- 即：`common` 与 `logger` 不 import 本项目其他包；`setting` 与 `cachex` 只依赖 `common`/`logger`；
+- 即：`common`、`logger`、`constant` 不 import 本项目其他包；`setting` 与 `cachex` 只依赖 `common`/`logger`；
   `model` 依赖 `setting/config` 与 `common`；`middleware` 依赖 `setting` 与 `logger`；`controller` 依赖 `model`。
 - `middleware` 不 import `controller`；`controller` 不 import `router`。
 - `setting/config` 与 `setting/*_setting` 不 import `model`（避免与 `model/option.go` 成环）：
@@ -262,9 +275,9 @@ func Get() *SystemSetting { return current.Load() }
 ```
 
 - 内存 map 与运行时结构体**必须一起改**，且只有 `updateOptionMap` 一个分发点。
-- `applySideEffects` 是一个集中 switch（文档的"一个大 switch"），M0 只处理
-  `system_setting.log_level`（调 `logger.SetLevel`）与 `system_setting.enable_access_log`（无需副作用，
-  由中间件读快照）。`status_message` / `slow_request_threshold_seconds` 也无副作用，同样读快照。
+- `applySideEffects` 是一个集中 switch（文档的"一个大 switch"）。M0 里**只有 `system_setting.log_level`
+  需要副作用**（调 `logger.SetLevel`）；`status_message`、`enable_access_log`、
+  `slow_request_threshold_seconds` 三个字段没有副作用，改完由 `middleware` 与 `/api/status` 直接读快照即可生效。
 - `validateOptionValue`：key 必须存在于注册表；值必须能解析成该字段类型。
 
 ### 4.5 SyncOptions 的多实例语义
@@ -289,28 +302,37 @@ func chooseDB(envName string, isLog bool) (gorm.Dialector, dbKind, error)
 | DSN | 驱动 | 备注 |
 |---|---|---|
 | `postgres://` / `postgresql://` | `gorm.io/driver/postgres` | 强制 `PreferSimpleProtocol=true`（兼容 PgBouncer/Neon） |
-| `clickhouse://` / `tcp://` / `http://` / `https://` | `gorm.io/driver/clickhouse` | **仅日志库**；主库遇到直接返回错误 |
+| `clickhouse://` / `tcp://` / `http://` / `https://` | 识别但不实现 | 主库遇到 → 返回"仅日志库允许"错误；日志库遇到 → 返回"ClickHouse 支持尚未引入（M6）"错误。分支先留好，**不假装支持** |
 | 空 或 `local` / `local:<path>` | `github.com/glebarez/sqlite`（纯 Go，免 CGO） | 空 → `whats-api.db`；`local` → 默认路径；`local:<path>` → 该路径 |
 | 其他 | `gorm.io/driver/mysql` | DSN 缺 `parseTime` 时补 `parseTime=true` |
 
 **M0 只本地验证 SQLite**：本机没有 MySQL / PostgreSQL / ClickHouse 服务。
-`chooseDB` 的分派与"主库拒绝 ClickHouse"用单元测试覆盖（断言返回的驱动类型与错误），
+`chooseDB` 的前缀分派、主库拒 ClickHouse、日志库拒未实现驱动，都用单元测试覆盖（断言返回的驱动类型与错误），
 **不谎称连过真实 MySQL/PG**。三库端到端验证留到有真实实例时（文档 §8 要求的那条纪律）。
 
 ### 5.2 方言 helper（一次到位，避免 M1/M2 回头改）
 
 ```go
-// 保留字列：PostgreSQL 用 "group"，MySQL/SQLite 用 `group`
-func commonGroupCol() string   // 包内保留字 group 的引用写法
-func commonKeyCol() string     // 保留字 key 的引用写法
+func commonKeyCol() string     // 保留字列 key 的引用写法：PG 用 "key"，MySQL/SQLite 用 `key`
 func commonTrueVal() string    // 按 dialect 返回 "1"/"0" 或 "true"/"false"
 func commonFalseVal() string
 func lockForUpdate(tx *gorm.DB) *gorm.DB  // MySQL/PG 发 FOR UPDATE；SQLite 原样返回
 func isSQLite() / isPostgres() / isMySQL() bool
 ```
 
-**实现形态说明**：文档里这三个是变量，本项目实现为**函数**——方言在 `InitDB` 后才知道，
-用函数取可以避免包级变量与 `InitDB` 的初始化顺序耦合（变量若在 `InitDB` 前被读取就是空串，静默出错）。
+**两处与文档的差异，都是为了不留死代码：**
+
+1. **不实现 `commonGroupCol`。** 文档需要它是因为库里有字面名为 `group` 的保留字列。
+   本项目按 `11-blueprint.md` §4 的 DDL 骨架，所有分组列统一命名 `group_name`
+   （`column:group_name`），从根上避开这个保留字。真正还需要 helper 的是 `key`
+   （`tokens.key`、`channels.key`），故保留 `commonKeyCol`。将来若真引入字面 `group` 列，
+   再把 `commonGroupCol` 补上。
+2. **实现为函数而非变量。** 方言在 `InitDB` 之后才知道；若做成包级变量，
+   在 `InitDB` 之前被读到就是空串——静默出错。函数取用没有这个初始化顺序耦合。
+
+**M0 的现实**：这些 helper 在 M0 只有测试调用（M0 没有裸 SQL，GORM 自己会为标识符加引号）。
+它们的价值在于 M1/M2 写条件 UPDATE 与裸 SQL 时**不必回头改数据层约定**，
+所以用测试钉住行为而不是等用到才写。
 
 `lockForUpdate` 的存在理由：**绝不用 `tx.Set("gorm:query_option", "FOR UPDATE")`**——GORM v2 会静默忽略它，
 "看起来有锁、实际没有"是并发保护里最阴险的一类 bug。
@@ -320,27 +342,83 @@ func isSQLite() / isPostgres() / isMySQL() bool
 ```go
 func Migrate() error {
     if !common.IsMasterNode { logger.Info("非 master 节点，跳过迁移"); return nil }
-    if err := DB.AutoMigrate(&Option{}, &Setup{}); err != nil { return err }
+    if err := DB.AutoMigrate(mainModels()...); err != nil { return err }
     for _, m := range targetedMigrations { if err := m(DB); err != nil { return err } }
     return nil
+}
+
+// 主库六张表
+func mainModels() []any {
+    return []any{&User{}, &Token{}, &Channel{}, &Ability{}, &Option{}, &Setup{}}
+}
+
+// 日志库单独迁移（LOG_SQL_DSN 为空时 LOG_DB == DB，等于在主库建这张表）
+func migrateLOGDB() error {
+    if !common.IsMasterNode { return nil }
+    return LOG_DB.AutoMigrate(&Log{})
 }
 ```
 
 - `targetedMigrations` 在 M0 为空切片，但**框架与调用点先建好**（M1/M2 会往里加）。
-- 幂等：`options` / `setup` 的建表与首次写入必须可重复执行；验收脚本连续启动三次。
-- `InitLogDB()`：`LOG_SQL_DSN` 为空 → `LOG_DB = DB`（`SharedWithMain=true`）；否则独立连接 + 独立迁移。
-  ClickHouse 的 MergeTree/TTL 特化不在 M0（日志表实体要到 M2/M5 才出现）。
+- 幂等：七张表的建表与 `setup` 首次写入必须可重复执行；验收脚本连续启动三次。
+- `logs` 走 `LOG_DB`，不进 `mainModels()`——这是 08 篇"日志库分离"的接缝，
+  M0 就把 `logs` 放在日志库，等于**当下就验证了这条接缝是通的**（测试：`LOG_SQL_DSN` 指向另一个
+  SQLite 文件时，`logs` 表出现在日志库而主库没有它）。
+- ClickHouse 的 MergeTree/TTL 特化不在 M0（驱动都没引，见 §5.1）。
 
 ### 5.4 setup
 
 ```go
 type Setup struct {
-    ID            uint   `gorm:"primaryKey"`
-    Version       string
+    ID            int    `gorm:"primaryKey"`
+    Version       string `gorm:"size:32"`
     InitializedAt int64
 }
 func CheckSetup() error   // 空表则写入第一行；已存在则拒绝（ID 固定为 1）
 ```
+
+### 5.5 M0 建的表与枚举
+
+字段**以 `11-blueprint.md` §4 的最小 DDL 骨架为准**（不自行扩列）；"M0 状态"列说明该表在本里程碑是否被读写。
+所有模型统一用 `ID int` 作主键（GORM `primaryKey`），复合主键表见 `abilities`。
+
+| 表 | 库 | M0 状态 | 关键列（**加粗 = 持久化枚举，ABI**） |
+|---|---|---|---|
+| `users` | 主 | 仅建表 | `username` UNIQUE、`password_hash`、**`role`**、**`status`**、`quota`、`used_quota`、`group_name`、`email`、`auth_version` |
+| `tokens` | 主 | 仅建表 | `key` UNIQUE、`user_id`、**`status`**、`expired_time`、`remain_quota`、`unlimited_quota`、`model_limits_enabled`、`model_limits`(TEXT)、`allow_ips`、`used_quota`、`group_name`、`accessed_at` |
+| `channels` | 主 | 仅建表 | **`type`**、`key`、`base_url`、`models`、`group_name`、`priority`、`weight`、`tag`、**`status`**、`model_mapping` / `param_override` / `header_override` / `setting`（全 TEXT） |
+| `abilities` | 主 | 仅建表 | 复合主键 (`group_name`, `model_name`, `channel_id`)、`enabled`、`priority`、`weight`、`tag` |
+| `logs` | **日志库** | 仅建表 | `user_id`、**`type`**、`model_name`、`quota`、`prompt_tokens`、`completion_tokens`、`use_time`、`is_stream`、`channel_id`、`group_name`、`token_name`、`ip`、`request_id`、`other`(TEXT) |
+| `options` | 主 | ★读写 | `key` PK、`value` |
+| `setup` | 主 | ★读写 | `id` PK、`version`、`initialized_at` |
+
+**贯穿所有表的五条约定**（照 08 篇规则）：
+
+1. 时间戳统一 `int64` unix 秒（前端 JS 不丢精度、三库行为一致），不用 `time.Time`；
+2. 金额/额度统一 `int64` 整数，永不 float；
+3. 所有 JSON 型字段用 `TEXT`（`model_mapping`、`param_override`、`header_override`、`setting`、
+   `model_limits`、`other`），不碰数据库特有 JSON 类型；Go 侧以 `string` 承载、显式编解码；
+4. **业务默认值写在代码里，不写进 GORM tag**：`enabled`、`unlimited_quota`、`status`、`priority`、
+   `weight` 等由写入方赋值（规则③：`gorm:"default:true"` 会让 AutoMigrate 每次重启发 ALTER TABLE）；
+5. 主键交给 GORM（`gorm:"primaryKey"`），不手写 `AUTO_INCREMENT` / `SERIAL`。
+
+**枚举（`internal/constant`，ABI：只增不改）**：
+
+```
+Role:          User=1,  Admin=10, Root=100
+UserStatus:    Enabled=1, Disabled=2
+ChannelStatus: Enabled=1, ManuallyDisabled=2, AutoDisabled=3
+TokenStatus:   Enabled=1, Disabled=2, Expired=3, Exhausted=4
+LogType:       Unknown=0, Consume=1, Topup=2, Manage=3, System=4, Error=5, Refund=6, Login=7
+```
+
+**这是本项目自定的编号**，不追求与 New API 数值一致——数值一旦落库就是 ABI，
+对齐一个外部项目的编号没有收益、只有风险。测试钉住这些数值：改编号必须让测试失败，
+因为线上库里已经存着旧值（`ChannelStatus` 的 `ManuallyDisabled` / `AutoDisabled` 从一开始就分开，
+正是为了 M4 那条"手动禁用的渠道不会被自动恢复"）。
+
+`RebuildAbilities()`（整表重建）是 08 篇明确要求的兜底，但它是 M4 的职责，M0 不实现——
+此时没有渠道写入路径，它没有数据源。M4 必须先补它再补选路。
 
 ---
 
@@ -495,15 +573,15 @@ func QuotaFromDecimalStrict(s string) (int, error)                  // 溢出/�
 |---|---|---|
 | `github.com/gin-gonic/gin` | HTTP | v1.10.x（Go 1.23 兼容） |
 | `gorm.io/gorm` | ORM | v1.25.x |
-| `gorm.io/driver/mysql` / `driver/postgres` | 三库 | 与 gorm 主版本匹配 |
+| `gorm.io/driver/mysql` / `driver/postgres` | MySQL / PostgreSQL | 与 gorm 主版本匹配 |
 | `github.com/glebarez/sqlite` | 纯 Go SQLite（免 CGO） | 需其 `modernc.org/sqlite` 依赖支持 Go 1.23 |
 | `github.com/go-redis/redis/v8` | Redis（文档指定 v8） | v8.11.x |
 | `github.com/shopspring/decimal` | `QuotaFromDecimal` | v1.4.x |
 | `github.com/joho/godotenv` | `.env` | v1.5.x |
 
-**不引入**：测试框架（用标准 `testing`）、日志库（用标准 `log/slog`）、内存 LRU 库（`cachex` 自己实现）。
-`gorm.io/driver/clickhouse` 只在 M0 的 `chooseDB` 分支里被识别（返回"仅日志库允许"的错误），
-实际驱动依赖推迟到真的接 ClickHouse 时再引。
+**不引入**：测试框架（用标准 `testing`）、日志库（用标准 `log/slog`）、内存 LRU 库（`cachex` 自己实现）、
+ClickHouse 驱动。ClickHouse 的 DSN 前缀在 `chooseDB` 里被**识别但拒绝**（主库→"仅日志库允许"、
+日志库→"尚未引入"），失败信息明确指向未来里程碑，而不是静默按 MySQL 去连。
 
 **风险与退路**：`github.com/glebarez/sqlite` 传递依赖的 `modernc.org/sqlite` 新版本若要求 Go > 1.23，
 则回退为 `gorm.io/driver/sqlite`（CGO）。本机有 gcc 13.2，可编译；代价是 Docker 构建需非 scratch 基础镜像
@@ -531,7 +609,8 @@ func QuotaFromDecimalStrict(s string) (int, error)                  // 溢出/�
 | `internal/common/quota_math_test.go` | 三档语义表驱动：正常/±Inf/NaN/超界/负数/round-half/`MaxWalletQuota` 边界；`AdminMap` 内容 |
 | `internal/setting/config/config_test.go` | key 生成（`module.jsonField`）、`ExportAllConfigs`、反射写回四种类型、未知 key 报错、类型不符报错且不写入、缺 json tag 时 `Register` panic、重复注册 panic |
 | `internal/setting/system_setting/system_setting_test.go` | 快照原子替换；并发读到的一定是完整版本（`-race` 下跑） |
-| `internal/model/main_test.go` | `chooseDB` 前缀分派（含主库拒 ClickHouse）、`lockForUpdate` 在 SQLite 下不产生 `FOR UPDATE`、`AutoMigrate` 连续三次幂等、非 master 不迁移 |
+| `internal/model/main_test.go` | `chooseDB` 前缀分派（含主库拒 ClickHouse、日志库拒未实现驱动）、`lockForUpdate` 在 SQLite 下不产生 `FOR UPDATE`、`AutoMigrate` 连续三次幂等、非 master 不迁移、`logs` 落在 `LOG_SQL_DSN` 指定的库而主库无此表 |
+| `internal/constant/constants_test.go` | 枚举数值 golden 断言：任何重编号都必须让测试失败（ABI 保护） |
 | `internal/model/option_test.go` | `InitOptionMap` 默认值 → DB 覆盖；`UpdateOption` 单一路径三者同时变；`SyncOptions` 在外部改库后收敛；未知 key 被拒 |
 | `internal/app/app_test.go` | `Run(ctx)` 取消后：在途请求拿到完整响应、DB 已关闭、后台 goroutine 已退出 |
 
@@ -579,11 +658,12 @@ func QuotaFromDecimalStrict(s string) (int, error)                  // 溢出/�
 1 chore: 初始化 Go module、目录骨架与交付物脚手架
 2 feat(common): 数值安全、JSON 封装、环境变量与 Redis 封装
 3 feat(setting): 反射驱动的配置注册表与原子快照
-4 feat(model): 三库兼容的 DB 初始化、幂等迁移与 Option 唯一写入路径
-5 feat(http): 中间件链、路由分组与 /api/status
-6 feat(app): 启动时序与优雅停机
-7 test: M0 验收脚本
-8 docs: README、环境变量清单与实施文档
+4 feat(model): 六张核心表模型、持久化枚举、三库兼容的 DB 初始化与幂等迁移
+5 feat(model): Option 表与配置唯一写入路径（UpdateOption / SyncOptions）
+6 feat(http): 中间件链、路由分组与 /api/status
+7 feat(app): 启动时序与优雅停机
+8 test: M0 验收脚本
+9 docs: README、环境变量清单与实施文档
 ```
 
 完成后推分支并按 `pr-submission-standard` 模板开 PR（功能描述 / 实现思路 / 测试方式 三段）。
