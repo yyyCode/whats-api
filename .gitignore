@@ -1,0 +1,21 @@
+# 环境与本地数据
+.env
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# 构建产物
+bin/
+dist/
+whats-api
+whats-api.exe
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 测试与覆盖率
+coverage.out
