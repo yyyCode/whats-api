@@ -32,11 +32,15 @@ func NewCounter(namespace string, ttl time.Duration) *Counter {
 
 // useRedis 每次调用都重新判断，而不是在构造时固化：
 // Redis 中途掉线后代码应继续工作（降级），而不是整片报错。
-func (c *Counter) useRedis() bool { return common.RedisEnabled && common.RDB != nil }
+func (c *Counter) useRedis() bool { return common.RedisEnabled() }
 
 func (c *Counter) key(key string) string { return c.namespace + ":" + key }
 
-// Backend 报告当前实际后端，供 /api/status 与运维排查使用。
+// Backend 报告**选用**的后端，供 /api/status 与运维排查使用。
+//
+// 它反映的是配置与启动期探测的结果，不含运行期单次调用的成败：
+// 启动时连通、之后 Redis 掉线时它仍返回 "redis"，而 Incr/Get 已经在
+// 回落到内存。要判断"此刻 Redis 是否真在服务"，得看错误日志而不是这里。
 func (c *Counter) Backend() string {
 	if c.useRedis() {
 		return "redis"
@@ -56,17 +60,18 @@ func (c *Counter) Incr(key string) (int64, error) {
 }
 
 // Get 读取当前值。内存后端的 TTL 是滑动窗口（与 Redis 路径的 EXPIRE 语义一致）。
+//
+// Redis 出错时回落到内存，与 Incr 对称。不对称会造出一个很难查的现象：
+// 掉线期间 Incr 写进了内存，而 Get 去读 Redis 得到 miss，刚加上的计数
+// 立刻"不存在"，看日志还以为没写进去。
 func (c *Counter) Get(key string) (int64, bool) {
 	if c.useRedis() {
 		raw, err := common.RedisGet(c.key(key))
-		if err != nil {
-			return 0, false
+		if err == nil {
+			if v, perr := parseCounter(raw); perr == nil {
+				return v, true
+			}
 		}
-		v, err := parseCounter(raw)
-		if err != nil {
-			return 0, false
-		}
-		return v, true
 	}
 	return c.memory.Get(key)
 }
