@@ -1,0 +1,15 @@
+# 本仓库在 Windows 上开发、在 Linux 上部署，而 core.autocrlf=true 会按平台
+# 转换行尾。凡是"最终在 Linux 上被执行"的文本都必须强制 LF，否则：
+#
+#   shell 脚本 → Linux 报 "bad interpreter: /bin/bash^M"
+#   Dockerfile → `RUN ... \` 的续行把 \r 一起带进命令
+#
+# 这两类问题在 Windows 上完全看不出来，只在部署那一刻炸。
+* text=auto
+
+*.sh                text eol=lf
+Dockerfile          text eol=lf
+docker-compose.yml  text eol=lf
+*.yml               text eol=lf
+*.go                text eol=lf
+*.md                text eol=lf
