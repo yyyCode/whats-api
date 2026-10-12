@@ -26,7 +26,7 @@ import (
 	"github.com/yyyCode/whats-api/internal/common"
 )
 
-// 支持的字段类型（M0）。扩展这里的同时要扩展 setField 与 fieldOf。
+// 支持的字段类型（M0）。扩展这里的同时要扩展 setField 与 encodeField。
 var supportedKinds = map[reflect.Kind]bool{
 	reflect.String:  true,
 	reflect.Bool:    true,
@@ -145,9 +145,9 @@ func (m *Manager) ExportAllConfigs() map[string]string {
 // lookupLocked 在持锁状态下解析 key。
 //
 // ★ 调用约定：必须在持锁时调用。它返回模块元数据与字段下标，
-//   而**写入**由调用方自己做——ValidateConfig 持读锁（它不写真实字段），
-//   UpdateConfig 持写锁（它要写）。把这两个锁语义混在一个函数里，
-//   迟早会出现"持读锁却写字段"的并发 bug。
+// 而**写入**由调用方自己做——ValidateConfig 持读锁（它不写真实字段），
+// UpdateConfig 持写锁（它要写）。把这两个锁语义混在一个函数里，
+// 迟早会出现"持读锁却写字段"的并发 bug。
 func (m *Manager) lookupLocked(key string) (*module, field, error) {
 	modName, jsonName, ok := splitKey(key)
 	if !ok {
@@ -286,6 +286,14 @@ func encodeField(fv reflect.Value) string {
 func setField(fv reflect.Value, rawJSON string) error {
 	if !fv.CanSet() {
 		return errors.New("字段不可写")
+	}
+
+	// null 必须显式拒掉：json.Unmarshal 对 null 不报错，而下面每种类型都是
+	// 先解析到零值局部变量再赋值——于是 null 会把配置静默改成零值
+	// （sync_frequency 60 → 0 这种）。管理端的一次非法请求不该悄悄改坏配置。
+	// 将来若支持指针类型字段（null 表示"未设置"），要在这里放行。
+	if strings.TrimSpace(rawJSON) == "null" {
+		return errors.New("null 不是合法取值")
 	}
 
 	switch fv.Kind() {

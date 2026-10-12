@@ -120,6 +120,8 @@ func TestUpdateConfigRejectsBadInputWithoutSideEffects(t *testing.T) {
 		{"字符串项给了数字", "test_setting.level", `123`},
 		{"布尔项给了对象", "test_setting.enable", `{}`},
 		{"浮点项给了数组", "test_setting.factor", `[]`},
+		{"整数项给了 null", "test_setting.count", `null`},
+		{"字符串项给了 null", "test_setting.level", `null`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -164,6 +166,7 @@ func TestValidateConfigDoesNotWriteAndAgreesWithUpdate(t *testing.T) {
 		{"test_setting.level", `123`},
 		{"test_setting.enable", `{}`},
 		{"test_setting.factor", `[]`},
+		{"test_setting.count", `null`},
 	}
 
 	// (a) 校验不写任何东西：值不变、快照不重建
