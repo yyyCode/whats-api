@@ -10,6 +10,9 @@ bin/
 dist/
 whats-api
 whats-api.exe
+optctl
+optctl.exe
+whats-api-linux
 
 # 编辑器 / 系统
 .DS_Store
