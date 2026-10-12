@@ -18,6 +18,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -25,6 +26,15 @@ import (
 
 	"github.com/yyyCode/whats-api/internal/common"
 )
+
+// typeLabel 给匿名结构体一个可读的名字：elem.Type().Name() 对它返回空串，
+// 报错信息就成了「字段 .B」，看不出是哪个模块出的问题。
+func typeLabel(t reflect.Type) string {
+	if n := t.Name(); n != "" {
+		return n
+	}
+	return t.String()
+}
 
 // 支持的字段类型（M0）。扩展这里的同时要扩展 setField 与 encodeField。
 var supportedKinds = map[reflect.Kind]bool{
@@ -69,6 +79,11 @@ func (m *Manager) Register(name string, cfg any) {
 		panic("config: 模块名不能为空")
 	}
 
+	if strings.Contains(name, ".") {
+		panic(fmt.Sprintf("config: 模块名 %q 不能含 '.'——配置 key 是「模块名.json tag」，"+
+			"名字里的点会让 key 拆不开，不同模块会撞进同一个 key", name))
+	}
+
 	rv := reflect.ValueOf(cfg)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		panic(fmt.Sprintf("config: Register(%q) 需要非 nil 的结构体指针，得到 %T", name, cfg))
@@ -85,11 +100,21 @@ func (m *Manager) Register(name string, cfg any) {
 			continue // 未导出字段不参与配置（也不报错：它可能只是内部状态）
 		}
 
-		jsonName := strings.Split(sf.Tag.Get("json"), ",")[0]
-		if jsonName == "" || jsonName == "-" {
+		rawTag := sf.Tag.Get("json")
+		// json:"-" 是 Go 里"明确排除该字段"的写法（json:"-," 才是名为 "-" 的字段），
+		// 不是漏写 tag，所以按未导出字段同样跳过而不是报错。
+		if rawTag == "-" {
+			continue
+		}
+		jsonName := strings.Split(rawTag, ",")[0]
+		if jsonName == "" {
 			panic(fmt.Sprintf("config: 模块 %q 的字段 %s.%s 缺少 json tag——"+
 				"配置 key 由「模块名.json tag」生成，缺 tag 会让持久化 key 漂移",
-				name, elem.Type().Name(), sf.Name))
+				name, typeLabel(elem.Type()), sf.Name))
+		}
+		if strings.Contains(jsonName, ".") {
+			panic(fmt.Sprintf("config: 模块 %q 的 json tag %q 不能含 '.'——"+
+				"它就是 key 的分隔符", name, jsonName))
 		}
 		if _, dup := fields[jsonName]; dup {
 			panic(fmt.Sprintf("config: 模块 %q 的 json tag %q 重复", name, jsonName))
@@ -97,6 +122,15 @@ func (m *Manager) Register(name string, cfg any) {
 		if !supportedKinds[sf.Type.Kind()] {
 			panic(fmt.Sprintf("config: 模块 %q 的字段 %s 类型 %s 不支持"+
 				"（M0 支持 string/bool/int/int64/float64）", name, sf.Name, sf.Type.Kind()))
+		}
+		// 非有限的浮点默认值必须在注册期就炸：json.Marshal 编不出 NaN/±Inf，
+		// MustMarshalString 会返回空串，于是 ExportAllConfigs（Option 表默认值的
+		// 来源）里出现一个不是 JSON 的 ""，等别处解析才报错，现场已经远离原因。
+		if sf.Type.Kind() == reflect.Float64 {
+			if f := elem.Field(i).Float(); math.IsNaN(f) || math.IsInf(f, 0) {
+				panic(fmt.Sprintf("config: 模块 %q 的字段 %s 默认值是 %v，无法序列化成 JSON"+
+					"（NaN/±Inf 不是合法 JSON 数值）", name, sf.Name, f))
+			}
 		}
 		fields[jsonName] = field{jsonName: jsonName, index: i}
 	}
