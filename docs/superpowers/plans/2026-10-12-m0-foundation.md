@@ -2675,6 +2675,13 @@ func TestUpdatePublishesNewSnapshot(t *testing.T) {
 	if after.EnableAccessLog != Default.EnableAccessLog {
 		t.Error("未修改的字段不应被连带改动")
 	}
+
+	// 恢复默认值，避免污染同包其他测试（TestConcurrentReadDuringUpdates
+	// 只接受默认值或 msg-N，见 plan 里同款清理约定）。
+	if err := config.GlobalConfig.UpdateConfig(
+		"system_setting.status_message", strconv.Quote(Default.StatusMessage)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // 布尔与浮点也要能热更新。
