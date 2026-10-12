@@ -75,6 +75,9 @@ bin/
 dist/
 whats-api
 whats-api.exe
+optctl
+optctl.exe
+whats-api-linux
 
 # 编辑器 / 系统
 .DS_Store
@@ -138,8 +141,13 @@ LOG_LEVEL=info
 
 - [ ] **Step 5: 验证**
 
-Run: `go build ./... && go vet ./...`
-Expected: 两条命令都无输出、退出码 0（此时模块里还没有包）。
+Run: `go build ./...`
+Expected: 退出码 0，stderr 只有一行 `go: warning: "./..." matched no packages`（此时模块里还没有包，这是正常的）。
+
+**不要在这里跑 `go vet ./...`，也不要期望它退出码 0。** 本任务不写 Go 代码，
+模块里没有包，`go vet` 会打印 `no packages to vet` 并**以退出码 1 结束**——
+那不是"代码有问题"，而是"没有可检查的对象"。从 Task 2 起模块里有了包，
+`go build` 与 `go vet` 才都成为有意义的验证（Task 10 做全量）。
 
 Run: `git status --short`
 Expected: 显示 `?? .env.example`、`?? .gitignore`、`?? go.mod`。
