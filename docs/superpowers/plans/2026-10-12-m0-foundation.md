@@ -2844,7 +2844,7 @@ Expected: `internal/common`、`internal/logger`。
 `common` 只允许依赖 logger/constant 这两个叶子，出现 `setting`、`cachex`、`model` 等上层包就是成环了。
 
 Run: `go list -deps ./internal/setting/config/ | grep whats-api`
-Expected: `internal/common`、`internal/setting/config`。
+Expected: `internal/logger`、`internal/common`、`internal/setting/config`（logger 经 common 传递依赖而来）。
 
 Run: `go list -deps ./internal/cachex/ | grep whats-api`
 Expected: `internal/cachex`、`internal/common`、`internal/logger`。
