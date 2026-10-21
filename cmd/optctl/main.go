@@ -21,9 +21,11 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/yyyCode/whats-api/internal/common"
+	"github.com/yyyCode/whats-api/internal/constant"
 	"github.com/yyyCode/whats-api/internal/logger"
 	"github.com/yyyCode/whats-api/internal/model"
 )
@@ -78,6 +80,15 @@ func run(args []string, out io.Writer) error {
 	case "list":
 		return runList(out)
 
+	case "user":
+		return runUser(args[1:], out)
+
+	case "token":
+		return runToken(args[1:], out)
+
+	case "channel":
+		return runChannel(args[1:], out)
+
 	default:
 		return fmt.Errorf("未知子命令 %q\n%s", args[0], usage)
 	}
@@ -114,12 +125,127 @@ func runList(out io.Writer) error {
 	return nil
 }
 
+// ---------- 夹具命令 ----------
+//
+// M1 还没有管理面（M3），但要让"端到端跑一次转发"可操作，就必须有一个
+// 从进程外创建用户/令牌/渠道的手段。这三个命令只做最少的字段填充，
+// 不承担校验职责——字段合法性与运行时的关系由 model 层保证。
+
+func runUser(args []string, out io.Writer) error {
+	if len(args) < 2 || args[0] != "add" || args[1] == "" {
+		return fmt.Errorf("用法: optctl user add <username> [<group>] [<quota>]\n%s", usage)
+	}
+	group, quota := "default", int64(0)
+	if len(args) >= 3 && strings.TrimSpace(args[2]) != "" {
+		group = strings.TrimSpace(args[2])
+	}
+	if len(args) >= 4 {
+		n, err := strconv.ParseInt(args[3], 10, 64)
+		if err != nil {
+			return fmt.Errorf("quota 必须是整数: %w", err)
+		}
+		quota = n
+	}
+
+	u := model.User{
+		Username:  args[1],
+		Role:      constant.RoleUser,
+		Status:    constant.UserStatusEnabled,
+		GroupName: group,
+		Quota:     quota,
+	}
+	if err := model.DB.Create(&u).Error; err != nil {
+		return fmt.Errorf("创建用户失败: %w", err)
+	}
+	fmt.Fprintf(out, "user id=%d username=%s group=%s quota=%d\n", u.ID, u.Username, u.GroupName, u.Quota)
+	return nil
+}
+
+func runToken(args []string, out io.Writer) error {
+	if len(args) < 3 || args[0] != "add" || args[1] == "" {
+		return fmt.Errorf("用法: optctl token add <key> <user-id>\n%s", usage)
+	}
+	userID, err := strconv.Atoi(args[2])
+	if err != nil {
+		return fmt.Errorf("user-id 必须是整数: %w", err)
+	}
+	user, err := model.GetUserByID(userID)
+	if err != nil {
+		return fmt.Errorf("用户 %d 不存在: %w", userID, err)
+	}
+
+	tok := model.Token{
+		Key:            args[1],
+		UserID:         userID,
+		Status:         constant.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		UnlimitedQuota: true, // M1 不计费；额度语义在 M2 落地
+		GroupName:      user.GroupName,
+	}
+	if err := model.DB.Create(&tok).Error; err != nil {
+		return fmt.Errorf("创建令牌失败: %w", err)
+	}
+	fmt.Fprintf(out, "token id=%d key=%s user_id=%d group=%s unlimited=%v\n",
+		tok.ID, tok.Key, tok.UserID, tok.GroupName, tok.UnlimitedQuota)
+	return nil
+}
+
+func runChannel(args []string, out io.Writer) error {
+	if len(args) < 5 || args[0] != "add" {
+		return fmt.Errorf("用法: optctl channel add <type> <key> <base-url> <models> [<group>] [<priority>] [<weight>]\n%s", usage)
+	}
+	apiType, err := strconv.Atoi(args[1])
+	if err != nil {
+		return fmt.Errorf("type 必须是整数: %w", err)
+	}
+	if apiType != constant.APITypeOpenAI {
+		return fmt.Errorf("M1 只支持 type=%d（OpenAI 兼容），收到 %d", constant.APITypeOpenAI, apiType)
+	}
+
+	group, priority, weight := "default", int64(0), uint(1)
+	if len(args) >= 6 && strings.TrimSpace(args[5]) != "" {
+		group = strings.TrimSpace(args[5])
+	}
+	if len(args) >= 7 {
+		if priority, err = strconv.ParseInt(args[6], 10, 64); err != nil {
+			return fmt.Errorf("priority 必须是整数: %w", err)
+		}
+	}
+	if len(args) >= 8 {
+		w, err := strconv.ParseUint(args[7], 10, 32)
+		if err != nil {
+			return fmt.Errorf("weight 必须是非负整数: %w", err)
+		}
+		weight = uint(w)
+	}
+
+	ch := model.Channel{
+		Type:      apiType,
+		Key:       args[2],
+		BaseURL:   strings.TrimRight(args[3], "/"),
+		Models:    args[4],
+		GroupName: group,
+		Priority:  priority,
+		Weight:    weight,
+		Status:    constant.ChannelStatusEnabled,
+	}
+	if err := model.DB.Create(&ch).Error; err != nil {
+		return fmt.Errorf("创建渠道失败: %w", err)
+	}
+	fmt.Fprintf(out, "channel id=%d type=%d models=%s group=%s priority=%d weight=%d\n",
+		ch.ID, ch.Type, ch.Models, ch.GroupName, ch.Priority, ch.Weight)
+	return nil
+}
+
 // usage 是变量而非常量：strings.TrimSpace 不是常量表达式。
 var usage = strings.TrimSpace(`
 用法:
   optctl get  <key>
   optctl set  <key> <json-value>
   optctl list
+  optctl user    add <username> [<group>] [<quota>]
+  optctl token   add <key> <user-id>
+  optctl channel add <type> <key> <base-url> <models> [<group>] [<priority>] [<weight>]
 
 值必须是 JSON 编码，字符串要带引号：
   optctl set system_setting.status_message '"你好"'
