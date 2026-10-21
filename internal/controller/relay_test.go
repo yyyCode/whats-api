@@ -36,6 +36,10 @@ func newRelayServer(t *testing.T) string {
 	if err := model.InitDB(); err != nil {
 		t.Fatalf("InitDB: %v", err)
 	}
+	// 计费链路会同步写消费/错误日志；LOG_SQL_DSN 为空时复用主库连接。
+	if err := model.InitLogDB(); err != nil {
+		t.Fatalf("InitLogDB: %v", err)
+	}
 	t.Cleanup(func() { _ = model.CloseDB() })
 
 	gin.SetMode(gin.TestMode)
@@ -49,18 +53,45 @@ func newRelayServer(t *testing.T) string {
 
 func seedUserToken(t *testing.T) *model.Token {
 	t.Helper()
-	u := model.User{Username: "u1", Status: constant.UserStatusEnabled, GroupName: "default"}
+	// 计费链路启用后，M1 用例也需要真实余额：预扣发生在选渠道之前，
+	// 余额为 0 会让所有既有转发用例在到达上游之前就收到 403。
+	u := model.User{
+		Username: "u1", Status: constant.UserStatusEnabled, GroupName: "default",
+		Quota: 100_000_000,
+	}
 	if err := model.DB.Create(&u).Error; err != nil {
 		t.Fatal(err)
 	}
 	tok := model.Token{
 		Key: "sk-test", UserID: u.ID, Status: constant.TokenStatusEnabled,
-		ExpiredTime: -1, UnlimitedQuota: true, GroupName: "default",
+		ExpiredTime: -1, UnlimitedQuota: true, RemainQuota: 0, GroupName: "default",
 	}
 	if err := model.DB.Create(&tok).Error; err != nil {
 		t.Fatal(err)
 	}
 	return &tok
+}
+
+// seedBillingUserToken 创建一对「钱包有额度、令牌可限额」的凭据，
+// 专门用于观察预扣/结算/退款对两边账本的精确影响。
+func seedBillingUserToken(t *testing.T, userQuota, tokenQuota int64, unlimited bool) (*model.User, *model.Token) {
+	t.Helper()
+	u := model.User{
+		Username: "billing-user", Status: constant.UserStatusEnabled,
+		GroupName: "default", Quota: userQuota,
+	}
+	if err := model.DB.Create(&u).Error; err != nil {
+		t.Fatal(err)
+	}
+	tok := model.Token{
+		Key: "sk-billing", UserID: u.ID, Status: constant.TokenStatusEnabled,
+		ExpiredTime: -1, UnlimitedQuota: unlimited, RemainQuota: tokenQuota,
+		GroupName: "default",
+	}
+	if err := model.DB.Create(&tok).Error; err != nil {
+		t.Fatal(err)
+	}
+	return &u, &tok
 }
 
 func seedChannel(t *testing.T, baseURL, models string, priority int64) *model.Channel {

@@ -53,6 +53,20 @@ type RequestPayload struct {
 	Stream bool   `json:"stream"`
 }
 
+// BillingMeta 是请求开始时冻结下来的计费快照。
+//
+// 它必须挂在 RequestState 上：预扣发生在选渠道之前，而预扣金额与当时的倍率
+// 不会随重试改变；结算与失败日志都要用「当时那一版」倍率复盘，
+// 不能事后再读配置（配置可以热更新，那会得到另一版金额）。
+type BillingMeta struct {
+	EstimatedPromptTokens int
+	PreConsumedQuota      int
+	ModelRatio            float64
+	CompletionRatio       float64
+	GroupRatio            float64
+	PreConsumeMultiplier  float64
+}
+
 // RequestState 跨尝试共享：身份、原始请求体、模型名、重试计数、最后一个错误。
 type RequestState struct {
 	RequestID       string
@@ -64,6 +78,11 @@ type RequestState struct {
 	Body            []byte
 	RetryIndex      int
 	LastError       *types.APIError
+	// TokenUnlimited 决定预扣/结算/退款是否触碰令牌的 remain_quota。
+	// 它在鉴权时就已确定，重试不会改变，因此属于跨尝试共享的状态。
+	TokenUnlimited bool
+	// Billing 是本次请求的预扣快照（估算 token、预扣金额、实际倍率）。
+	Billing BillingMeta
 	// StartTime 是请求开始的时刻，用于消费日志里的 UseTime（请求耗时）。
 	// 它必须留在 RequestState：重试会重置 AttemptState，但一次请求的耗时
 	// 应覆盖所有尝试，不能从最后一个渠道才开始计时。
@@ -119,6 +138,7 @@ func GenRelayInfo(auth *AuthInfo, payload *RequestPayload, requestID string, bod
 			OriginModelName: payload.Model,
 			IsStream:        payload.Stream,
 			Body:            body,
+			TokenUnlimited:  auth.UnlimitedQuota,
 			StartTime:       time.Now(),
 		},
 		Stream: StreamOptions{PingInterval: DefaultPingInterval},
