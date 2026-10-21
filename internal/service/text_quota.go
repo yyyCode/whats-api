@@ -109,6 +109,30 @@ func fallbackPromptTokens(body []byte) int {
 	return n
 }
 
+// TextPricing 是计算一次文本请求金额所需的全部倍率。
+//
+// 它是一次快照读取的结果：配置热更新会整体替换快照，若分别读取四个访问器，
+// 一次计算就可能混用两版配置，算出的金额无法用任何一版配置复盘。因此预扣把
+// 这份结构冻结进请求上下文，结算直接复用它，而不是结束前再读配置。
+type TextPricing struct {
+	ModelRatio           float64
+	CompletionRatio      float64
+	GroupRatio           float64
+	PreConsumeMultiplier float64
+}
+
+// ResolveTextPricing 从当前生效的快照解析一组倍率。
+// 全部字段来自同一个快照对象，保证内部一致。
+func ResolveTextPricing(model, group string) TextPricing {
+	snap := ratio_setting.Get()
+	return TextPricing{
+		ModelRatio:           snap.ModelRatio(model),
+		CompletionRatio:      snap.CompletionRatio(model),
+		GroupRatio:           snap.GroupRatio(group),
+		PreConsumeMultiplier: snap.PreConsumeMultiplier(),
+	}
+}
+
 // EstimatePreConsumeQuota 计算请求开始前的预扣额度。
 //
 // 公式（modelRatio 的单位是「美元 / 100 万输入 token」）：
@@ -119,20 +143,23 @@ func fallbackPromptTokens(body []byte) int {
 // 结算时再按实际 usage 补扣或退款。预扣用 Strict 取整——溢出/NaN 时
 // 宁可拒绝请求，也不能按一个错误的金额冻结用户余额。
 func EstimatePreConsumeQuota(model string, promptTokens int, group string) (int, QuotaDetail, error) {
-	modelRatio := ratio_setting.ModelRatio(model)
-	groupRatio := ratio_setting.GroupRatio(group)
-	multiplier := ratio_setting.PreConsumeMultiplier()
+	return estimatePreConsumeQuota(ResolveTextPricing(model, group), promptTokens)
+}
 
+func estimatePreConsumeQuota(pricing TextPricing, promptTokens int) (int, QuotaDetail, error) {
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
 	detail := QuotaDetail{
-		ModelRatio:           modelRatio,
-		CompletionRatio:      ratio_setting.CompletionRatio(model),
-		GroupRatio:           groupRatio,
-		PreConsumeMultiplier: multiplier,
+		ModelRatio:           pricing.ModelRatio,
+		CompletionRatio:      pricing.CompletionRatio,
+		GroupRatio:           pricing.GroupRatio,
+		PreConsumeMultiplier: pricing.PreConsumeMultiplier,
 		PromptTokens:         promptTokens,
 	}
 
-	preRaw := float64(promptTokens) * modelRatio * multiplier *
-		float64(common.QuotaPerUnit) / 1e6 * groupRatio
+	preRaw := float64(promptTokens) * pricing.ModelRatio * pricing.PreConsumeMultiplier *
+		float64(common.QuotaPerUnit) / 1e6 * pricing.GroupRatio
 
 	quota, err := common.QuotaRoundStrict(preRaw)
 	if err != nil {
@@ -153,25 +180,35 @@ func EstimatePreConsumeQuota(model string, promptTokens int, group string) (int,
 //
 //	(prompt + completion × completionRatio) × modelRatio × QuotaPerUnit / 1e6 × groupRatio
 //
+// pricing 必须来自请求开始时冻结的快照（见 TextPricing），而不是结算时
+// 重新读配置：请求在飞行途中配置可能被热更新，用新倍率结算会让账本与
+// 日志里记录的预扣依据对不上。
+//
 // 结算用 Checked：数值异常时饱和并在 detail.QuotaClamp 里留痕，
 // 由调用方写日志；这里不能返回 error，因为上游请求已经执行完，
 // 结算金额再异常也必须走完记账流程，不能把异常响应回给客户端。
-func CalculateTextQuota(model string, promptTokens, completionTokens int, group string) (int, QuotaDetail) {
-	modelRatio := ratio_setting.ModelRatio(model)
-	completionRatio := ratio_setting.CompletionRatio(model)
-	groupRatio := ratio_setting.GroupRatio(group)
+func CalculateTextQuota(promptTokens, completionTokens int, pricing TextPricing) (int, QuotaDetail) {
+	// usage 的合法性由 types.Usage.Valid 把关；这里再做一次钳制，
+	// 保证任何调用方都不可能用负 token 算出负金额（负金额会被取整成 0，
+	// 等于白送一次请求）。
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if completionTokens < 0 {
+		completionTokens = 0
+	}
 
 	detail := QuotaDetail{
-		ModelRatio:           modelRatio,
-		CompletionRatio:      completionRatio,
-		GroupRatio:           groupRatio,
-		PreConsumeMultiplier: ratio_setting.PreConsumeMultiplier(),
+		ModelRatio:           pricing.ModelRatio,
+		CompletionRatio:      pricing.CompletionRatio,
+		GroupRatio:           pricing.GroupRatio,
+		PreConsumeMultiplier: pricing.PreConsumeMultiplier,
 		PromptTokens:         promptTokens,
 		CompletionTokens:     completionTokens,
 	}
 
-	settleRaw := (float64(promptTokens) + float64(completionTokens)*completionRatio) *
-		modelRatio * float64(common.QuotaPerUnit) / 1e6 * groupRatio
+	settleRaw := (float64(promptTokens) + float64(completionTokens)*pricing.CompletionRatio) *
+		pricing.ModelRatio * float64(common.QuotaPerUnit) / 1e6 * pricing.GroupRatio
 
 	quota, clamp := common.QuotaRoundChecked(settleRaw)
 	detail.QuotaClamp = clamp

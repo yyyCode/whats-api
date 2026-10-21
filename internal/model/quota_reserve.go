@@ -154,13 +154,29 @@ func SettleQuota(userID, tokenID int, unlimited bool, delta, actual int) error {
 	}
 
 	return d.Transaction(func(tx *gorm.DB) error {
-		if !unlimited {
-			if err := settleTokenQuota(tx, tokenID, delta, actual); err != nil {
+		if unlimited {
+			// 无限令牌不调整 remain_quota，但用量仍然要记：
+			// used_quota 是「这把 key 花了多少」的唯一依据，跳过它会让
+			// 最常见的无限令牌在报表里永远是 0。它也不参与透支判断，
+			// 因此不需要事务里的条件 UPDATE。
+			if err := accumulateTokenUsedQuota(tx, tokenID, actual); err != nil {
 				return err
 			}
+		} else if err := settleTokenQuota(tx, tokenID, delta, actual); err != nil {
+			return err
 		}
 		return settleUserQuota(tx, userID, delta, actual)
 	})
+}
+
+// accumulateTokenUsedQuota 只累加令牌的 used_quota，不碰 remain_quota。
+//
+// 不检查 RowsAffected：actual 为 0 时 SQL 是合法的 no-op，而 MySQL 默认
+// 对「值未变化」的 UPDATE 返回 0 行，按行数判断存在性会误报令牌不存在。
+func accumulateTokenUsedQuota(tx *gorm.DB, id, actual int) error {
+	return tx.Model(&Token{}).
+		Where("id = ?", id).
+		UpdateColumn("used_quota", gorm.Expr("used_quota + ?", actual)).Error
 }
 
 // settleUserQuota 在事务内结算用户钱包。

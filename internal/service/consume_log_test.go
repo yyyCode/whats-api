@@ -154,7 +154,7 @@ func TestBuildBillingErrorLog(t *testing.T) {
 	info, _, detail := consumeLogFixture()
 	reason := "上游未返回 usage，已退还预扣"
 
-	l := BuildBillingErrorLog(info, reason, detail, "198.51.100.7")
+	l := BuildBillingErrorLog(info, reason, detail, true, "198.51.100.7")
 
 	if l.Type != constant.LogTypeError {
 		t.Errorf("Type = %d，期望 %d", l.Type, constant.LogTypeError)
@@ -184,6 +184,17 @@ func TestBuildBillingErrorLog(t *testing.T) {
 	assertOtherNumber(t, other, "pre_consumed", float64(detail.PreConsumedQuota))
 	assertOtherNumber(t, other, "actual", float64(detail.ActualQuota))
 	assertOtherString(t, other, "quota_saturation", detail.QuotaClamp.String())
+}
+
+// 退款失败时日志必须如实写 refunded=false，不能留下虚假的「已退款」记录。
+func TestBuildBillingErrorLogRecordsRefundFailure(t *testing.T) {
+	info, _, detail := consumeLogFixture()
+	l := BuildBillingErrorLog(info, "退款失败，预扣仍冻结", detail, false, "198.51.100.7")
+
+	other := decodeLogOther(t, l)
+	if refunded, ok := other["refunded"].(bool); !ok || refunded {
+		t.Errorf("other[refunded] = %#v，期望 false", other["refunded"])
+	}
 }
 
 // 日志库未初始化时必须返回明确错误，而不是静默丢弃审计记录。

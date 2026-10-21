@@ -98,6 +98,26 @@ func TestInvalidJSONKeepsPreviousSnapshot(t *testing.T) {
 	}
 }
 
+// 负倍率不是「便宜」，而是坏配置：它会让结算金额变成 0 或负数，
+// 必须与语法错误一样整体拒绝，保留上一份快照。
+func TestNegativeRatioKeepsPreviousSnapshot(t *testing.T) {
+	restoreConfig(t, modelRatiosKey)
+
+	before := Get()
+	if err := config.GlobalConfig.UpdateConfig(
+		modelRatiosKey, strconv.Quote(`{"gpt-4o":-2.5}`)); err != nil {
+		t.Fatalf("UpdateConfig 写入字符串失败: %v", err)
+	}
+
+	after := Get()
+	if after != before {
+		t.Fatal("负倍率不应发布新快照（旧快照必须原样保留）")
+	}
+	if got := ModelRatio("gpt-4o"); got != 2.5 {
+		t.Errorf("负倍率被拒后 gpt-4o 倍率 = %v，期望仍是 2.5", got)
+	}
+}
+
 // 合法 JSON 写入后，下一次读取就必须看到新值。
 func TestValidJSONUpdatesSnapshot(t *testing.T) {
 	restoreConfig(t, modelRatiosKey)

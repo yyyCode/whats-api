@@ -30,6 +30,47 @@ func restoreRatioConfig(t *testing.T, key string) {
 	})
 }
 
+// pricingFor 是测试里读取当前配置的便捷入口；生产代码应在请求开始时
+// 调用一次并把结果冻结起来，而不是每次计算都重读。
+func pricingFor(model, group string) TextPricing {
+	return ResolveTextPricing(model, group)
+}
+
+// 结算必须使用调用方传入的冻结倍率，而不是结算时的最新配置：
+// 请求飞行途中调价，历史账目仍应按开始时的价格复盘。
+func TestCalculateTextQuotaUsesFrozenPricing(t *testing.T) {
+	restoreRatioConfig(t, modelRatiosKey)
+
+	frozen := pricingFor("gpt-4o", "default")
+	if frozen.ModelRatio != 2.5 {
+		t.Fatalf("测试前提失效：gpt-4o 当前倍率 = %v，期望 2.5", frozen.ModelRatio)
+	}
+
+	// 模拟请求开始后管理员把价格从 2.5 改成 1.0。
+	if err := config.GlobalConfig.UpdateConfig(modelRatiosKey, strconv.Quote(`{"gpt-4o":1}`)); err != nil {
+		t.Fatalf("更新 model_ratios 失败: %v", err)
+	}
+
+	got, detail := CalculateTextQuota(1_000_000, 0, frozen)
+	if got != 1_250_000 { // 仍按 2.5 结算
+		t.Errorf("用冻结倍率结算 = %d，期望 1250000", got)
+	}
+	if detail.ModelRatio != 2.5 {
+		t.Errorf("detail.ModelRatio = %v，期望冻结值 2.5", detail.ModelRatio)
+	}
+}
+
+// 负 token 不可能算出正金额，任何调用方都不该让一次请求变成免费。
+func TestCalculateTextQuotaClampsNegativeTokens(t *testing.T) {
+	got, detail := CalculateTextQuota(-100, 10, pricingFor("gpt-4o", "default"))
+	if got <= 0 {
+		t.Errorf("负输入 token 的结算 = %d，期望 > 0", got)
+	}
+	if detail.PromptTokens != 0 {
+		t.Errorf("detail.PromptTokens = %d，期望钳制为 0", detail.PromptTokens)
+	}
+}
+
 func TestEstimatePreConsumeQuotaFormula(t *testing.T) {
 	// gpt-4o = 2.5 美元/百万输入 token；预扣系数 1.2；QuotaPerUnit = 500000。
 	// 1,000,000 × 2.5 × 1.2 × 500000 / 1e6 = 1,500,000 quota。
@@ -65,7 +106,7 @@ func TestCalculateTextQuotaFormula(t *testing.T) {
 	const prompt = 1_000_000
 
 	// 只有输入：1,000,000 × 2.5 × 500000 / 1e6 = 1,250,000。
-	got, detail := CalculateTextQuota("gpt-4o", prompt, 0, "default")
+	got, detail := CalculateTextQuota(prompt, 0, pricingFor("gpt-4o", "default"))
 	if got != 1_250_000 {
 		t.Errorf("结算额度（无输出）= %d，期望 1250000", got)
 	}
@@ -79,7 +120,7 @@ func TestCalculateTextQuotaFormula(t *testing.T) {
 
 	// 输出 1,000,000 token，completionRatio=4：
 	// (1e6 + 1e6×4) × 2.5 × 500000 / 1e6 = 6,250,000。
-	got, detail = CalculateTextQuota("gpt-4o", prompt, prompt, "default")
+	got, detail = CalculateTextQuota(prompt, prompt, pricingFor("gpt-4o", "default"))
 	if got != 6_250_000 {
 		t.Errorf("结算额度（含输出）= %d，期望 6250000", got)
 	}
@@ -109,7 +150,7 @@ func TestQuotaUnknownModelUsesDefaults(t *testing.T) {
 			preDetail.ModelRatio, preDetail.CompletionRatio, preDetail.GroupRatio)
 	}
 
-	actual, detail := CalculateTextQuota("no-such-model", prompt, prompt, "default")
+	actual, detail := CalculateTextQuota(prompt, prompt, pricingFor("no-such-model", "default"))
 	// (1e6 + 1e6×4) × 1 × 0.5 = 2,500,000。
 	if actual != 2_500_000 {
 		t.Errorf("未知模型结算 = %d，期望 2500000", actual)
@@ -141,7 +182,7 @@ func TestQuotaUsesGroupRatio(t *testing.T) {
 		t.Errorf("预扣 detail.GroupRatio = %v，期望 2", preDetail.GroupRatio)
 	}
 
-	actual, detail := CalculateTextQuota("gpt-4o", prompt, 0, "vip")
+	actual, detail := CalculateTextQuota(prompt, 0, pricingFor("gpt-4o", "vip"))
 	if actual != 2_500_000 {
 		t.Errorf("vip 分组结算 = %d，期望 2500000", actual)
 	}
@@ -165,7 +206,7 @@ func TestQuotaTinyAmountBumpsToOne(t *testing.T) {
 	}
 
 	// 结算同样有下限：0.15 × 0.5 × prompt=1 → 0.075。
-	actual, settleDetail := CalculateTextQuota("gpt-4o-mini", 1, 0, "default")
+	actual, settleDetail := CalculateTextQuota(1, 0, pricingFor("gpt-4o-mini", "default"))
 	if actual != 1 {
 		t.Errorf("极小金额结算 = %d，期望抬到 1", actual)
 	}
@@ -193,7 +234,7 @@ func TestQuotaZeroRatioStaysZero(t *testing.T) {
 		t.Errorf("免费模型 detail.ModelRatio = %v，期望 0", preDetail.ModelRatio)
 	}
 
-	actual, settleDetail := CalculateTextQuota("free", 1_000_000, 1_000_000, "default")
+	actual, settleDetail := CalculateTextQuota(1_000_000, 1_000_000, pricingFor("free", "default"))
 	if actual != 0 || settleDetail.ActualQuota != 0 {
 		t.Errorf("免费模型结算 = (%d, detail %d)，期望 0", actual, settleDetail.ActualQuota)
 	}

@@ -13,6 +13,7 @@ package ratio_setting
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sync/atomic"
 
 	"github.com/yyyCode/whats-api/internal/logger"
@@ -170,6 +171,31 @@ func buildSnapshot(s RatioSetting) (*Snapshot, error) {
 		return nil, fmt.Errorf("解析 group_ratios 失败: %w", err)
 	}
 
+	// 负数/NaN/Inf 不是"便宜的定价"，而是会让账本失去意义的坏配置：
+	// 负倍率算出负金额，取整后变成 0（免费）或直接让预扣失败。
+	// 与 JSON 语法错误同等对待——保留上一份快照，而不是让某个模型/分组
+	// 在全网范围内按错误价格放行。
+	if err := validateRatios("model_ratios", modelRatios); err != nil {
+		return nil, err
+	}
+	if err := validateRatios("completion_ratios", completionRatios); err != nil {
+		return nil, err
+	}
+	if err := validateRatios("group_ratios", groupRatios); err != nil {
+		return nil, err
+	}
+	if err := validateFiniteNonNegative("default_model_ratio", s.DefaultModelRatio); err != nil {
+		return nil, err
+	}
+	if err := validateFiniteNonNegative("default_completion_ratio", s.DefaultCompletionRatio); err != nil {
+		return nil, err
+	}
+	// 预扣系数 <=0 已有回退到 1 的语义，但 NaN/Inf 无法参与算术，必须拒绝。
+	if math.IsNaN(s.InputPreConsumeMultiplier) || math.IsInf(s.InputPreConsumeMultiplier, 0) {
+		return nil, fmt.Errorf("input_pre_consume_multiplier 必须是有限数，得到 %v",
+			s.InputPreConsumeMultiplier)
+	}
+
 	return &Snapshot{
 		modelRatios:               modelRatios,
 		completionRatios:          completionRatios,
@@ -178,4 +204,22 @@ func buildSnapshot(s RatioSetting) (*Snapshot, error) {
 		defaultCompletionRatio:    s.DefaultCompletionRatio,
 		inputPreConsumeMultiplier: s.InputPreConsumeMultiplier,
 	}, nil
+}
+
+// validateRatios 校验一张倍率表：每个值都必须是非负有限数。
+// 0 是合法值（免费模型/免费分组），负数与 NaN/Inf 一律拒绝。
+func validateRatios(name string, ratios map[string]float64) error {
+	for key, v := range ratios {
+		if err := validateFiniteNonNegative(name+"["+key+"]", v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateFiniteNonNegative(name string, v float64) error {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return fmt.Errorf("%s 必须是非负有限数，得到 %v", name, v)
+	}
+	return nil
 }
