@@ -344,6 +344,49 @@ func TestRelayStopsUpstreamWhenClientDisconnects(t *testing.T) {
 	}
 }
 
+// 上游返回 3xx 时不能跟随重定向（POST 可能变 GET、丢 body 与凭证），
+// 也不能把随后的登录页当成功响应透传；应归一化为 502 且不禁用渠道。
+func TestRelayDoesNotFollowUpstreamRedirect(t *testing.T) {
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, "<html>login</html>")
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/login", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	base := newRelayServer(t)
+	seedUserToken(t)
+	ch := seedChannel(t, redirector.URL, "gpt-4o", 0)
+
+	resp := postChat(t, base, `{"model":"gpt-4o","messages":[]}`)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d，期望 502；body=%s", resp.StatusCode, body)
+	}
+	if targetHits.Load() != 0 {
+		t.Errorf("不该跟随上游重定向，目标被命中 %d 次", targetHits.Load())
+	}
+	if strings.Contains(string(body), "login") {
+		t.Errorf("重定向目标的内容不该透传给客户端: %q", body)
+	}
+
+	var stored model.Channel
+	if err := model.DB.First(&stored, ch.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != constant.ChannelStatusEnabled {
+		t.Errorf("3xx 是配置问题，不该自动禁用渠道，实际 status=%d", stored.Status)
+	}
+}
+
 func TestRelayAuthFailureUsesOpenAIShape(t *testing.T) {
 	base := newRelayServer(t)
 	seedUserToken(t)

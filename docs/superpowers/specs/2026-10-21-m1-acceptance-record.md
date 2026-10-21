@@ -17,7 +17,7 @@
 | ③ | 长响应有保活 | `TestStreamScannerSendsKeepAlive` | **PASS** |
 | ④ | 单渠道故障自动禁用并在后续请求中跳过 | `TestRelayRetriesOnUpstream5xxAndDisablesChannel`（第二段断言） | **PASS** |
 
-附加验证：非流式响应字节级透传（`TestRelayNonStreamPassthrough`）、模型映射改写上游请求体（`TestRelayAppliesModelMapping`）、鉴权失败返回 OpenAI 错误形状（`TestRelayAuthFailureUsesOpenAIShape`）。
+附加验证：非流式响应字节级透传（`TestRelayNonStreamPassthrough`）、模型映射改写上游请求体（`TestRelayAppliesModelMapping`）、鉴权失败返回 OpenAI 错误形状（`TestRelayAuthFailureUsesOpenAIShape`）、不跟随上游重定向且不禁用渠道（`TestRelayDoesNotFollowUpstreamRedirect`）、客户端断开不误判渠道故障（`TestDoResponseClientGoneIsNotChannelError`）、`/v1` panic 保持 OpenAI 形状（`TestRecoveryUsesOpenAIShapeOnRelayPath`）。
 
 ## 全量门禁（真实输出）
 
@@ -97,6 +97,31 @@ ok      github.com/yyyCode/whats-api/internal/relay/helper     4.279s
 
 这些用例不是 mock 出来的「单元级」验证：它们启动真实的 `gin` 路由、真实 SQLite 临时库、`httptest` 上游（真实 TCP 监听），再用 Go 的标准 HTTP 客户端发请求。也就是说，路由、鉴权、选路、适配器、SSE 转发、重试与自动禁用都走了生产代码路径。
 
+### 终审修复后的复跑（同日）
+
+终审发现三处问题并修复：非流式 body 读失败时客户端断开被误判渠道故障、出站客户端默认跟随重定向、`/v1` panic 返回管理面信封。修复后重跑：
+
+```text
+$ go test ./internal/controller/ -run 'TestRelay' -v -count=1
+--- PASS: TestRelayNonStreamPassthrough (0.06s)
+--- PASS: TestRelayAppliesModelMapping (0.03s)
+--- PASS: TestRelayRetriesOnUpstream5xxAndDisablesChannel (0.04s)
+--- PASS: TestRelayDoesNotRetryAfterStreamStarted (0.04s)
+--- PASS: TestRelayStreamsIncrementally (0.60s)
+--- PASS: TestRelayStopsUpstreamWhenClientDisconnects (0.09s)
+--- PASS: TestRelayDoesNotFollowUpstreamRedirect (0.08s)
+--- PASS: TestRelayAuthFailureUsesOpenAIShape (0.04s)
+ok  	github.com/yyyCode/whats-api/internal/controller	7.618s
+
+$ go test ./internal/middleware/ -run TestRecoveryUsesOpenAIShapeOnRelayPath -v -count=1
+--- PASS: TestRecoveryUsesOpenAIShapeOnRelayPath (0.01s)
+
+$ go test ./internal/relay/channel/openai/ -run TestDoResponseClientGone -v -count=1
+--- PASS: TestDoResponseClientGoneIsNotChannelError (0.00s)
+```
+
+修复后同样重跑了全量门禁（`go build` / `go vet` / `gofmt -l` 全清，`go test -count=1 ./...` 全包 ok）与 `-race`（同一组并发敏感包，全 ok），耗时数字略有变化，结论与上表一致。
+
 ## 明确未验证事项（不谎称通过）
 
 | 事项 | 原因 | 复核方式 |
@@ -108,7 +133,7 @@ ok      github.com/yyyCode/whats-api/internal/relay/helper     4.279s
 | 计费与 usage 统计 | M2 主题；M1 解析后丢弃 usage | 不在本阶段范围 |
 | MySQL / PostgreSQL 实连 | 本机无这两个服务 | 起容器后把 `SQL_DSN` 指过去，重跑转发用例 |
 | TCP 代理（`ProxyFromEnvironment`）行为 | 本机未配置代理 | 在需要代理的环境复核 |
-| 上游 3xx 重定向 | 代码按「非 2xx 即上游错误」处理，未对真实重定向服务验证 | 用返回 302 的假上游确认行为符合预期 |
+| 上游 3xx 重定向 | 已用返回 302 的 `httptest` 上游验证：网关回 502、不跟随、不禁用渠道 | 接一个真实会重定向的 `base_url` 复核 |
 | 超过 60 秒的长流 | e2e 只跑了 0.5 秒的流；保活间隔在单测里用 50ms 观察 | 用慢速真实上游跑一次 > 60s 的流 |
 | 32MB 请求体上限 | 未做压力验证 | 用接近上限的多模态请求复核 |
 | `optctl` 三个夹具命令的进程外真实调用 | 只有包内测试；未在一次真实进程启动后手工执行 | 按文末步骤做一次手工冒烟 |
@@ -145,3 +170,6 @@ curl -N http://127.0.0.1:3000/v1/chat/completions \
 | 令牌名称 | `AuthInfo.TokenName` 留空 | `Token` 模型没有 `name` 列；把明文 key 放进上下文只会给日志埋泄漏点 |
 | 非流式响应 | 原样透传上游状态码与 Content-Type | M1 是透传；改写响应形状会让客户端难以解释 |
 | 3xx 上游响应 | 归一化为 502，但不重试、不自动禁用 | `base_url` 配错时常见 3xx；同一请求里换渠道不会让配置变对，禁用只会把唯一渠道也打掉 |
+| 出站重定向 | `sharedClient` 设 `CheckRedirect = ErrUseLastResponse`，3xx 原样交给 `DoResponse` | Go 默认跟随重定向：POST 常被改成 GET、丢掉 body 与跨主机 Authorization，最后把登录页当成功响应透传 |
+| `/v1` 的 panic 响应 | 返回 OpenAI 错误形状（`error.type=server_error`），`/api` 仍是管理面信封 | 两个面的错误契约从 M1 起分开；SDK 不解析管理面信封 |
+| 慢客户端写阻塞 | 未设写超时：客户端保持连接但不读时，SSE 写协程可能被阻塞较久 | M1 不引入连接级超时；需要时在 M3 用 `http.Server.WriteTimeout`/单事件写超时解决 |
