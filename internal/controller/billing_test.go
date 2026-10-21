@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/yyyCode/whats-api/internal/constant"
 	"github.com/yyyCode/whats-api/internal/model"
+	"github.com/yyyCode/whats-api/internal/setting/config"
 )
 
 // postChatWithKey 与 postChat 相同，只是允许指定令牌 key：
@@ -159,6 +161,88 @@ func TestRelayChargesFromUsage(t *testing.T) {
 	if logs := logsOfType(t, constant.LogTypeError); len(logs) != 0 {
 		t.Errorf("成功请求不应有错误日志，实际 %d 条", len(logs))
 	}
+}
+
+// 请求开始后、结算之前调价：本次请求仍按预扣时冻结的倍率结算，
+// 日志里的 model_ratio 也必须是冻结值，否则历史金额无法复盘。
+func TestRelaySettlesWithFrozenPricing(t *testing.T) {
+	const key = "ratio_setting.model_ratios"
+	orig, ok := config.GlobalConfig.GetConfig(key)
+	if !ok {
+		t.Fatalf("配置项 %q 未注册", key)
+	}
+	t.Cleanup(func() {
+		if err := config.GlobalConfig.UpdateConfig(key, orig); err != nil {
+			t.Errorf("恢复 %s 失败: %v", key, err)
+		}
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 此刻预扣已完成（按 2.5 冻结），把线上价格改成 1.0。
+		if err := config.GlobalConfig.UpdateConfig(key,
+			strconv.Quote(`{"gpt-4o":1}`)); err != nil {
+			t.Errorf("请求途中更新倍率失败: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, usage1000x200)
+	}))
+	defer upstream.Close()
+
+	base := newRelayServer(t)
+	user, tok := seedBillingUserToken(t, 1_000_000, 1_000_000, false)
+	seedChannel(t, upstream.URL, "gpt-4o", 0)
+
+	resp := postChatWithKey(t, base, tok.Key,
+		`{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d body=%s", resp.StatusCode, body)
+	}
+
+	// 仍按 2.5 结算：(1000 + 200×4) × 2.5 × 0.5 = 2250。
+	const wantRemain int64 = 1_000_000 - 2250
+	if got := loadUser(t, user.ID); got.Quota != wantRemain || got.UsedQuota != 2250 {
+		t.Errorf("用户账本 = (quota %d, used %d)，期望 (%d, 2250)（不应按新倍率 1.0 结算）",
+			got.Quota, got.UsedQuota, wantRemain)
+	}
+
+	consume := logsOfType(t, constant.LogTypeConsume)
+	if len(consume) != 1 {
+		t.Fatalf("消费日志数 = %d，期望 1 条", len(consume))
+	}
+	other := decodeOther(t, consume[0])
+	assertOtherNumber(t, other, "model_ratio", 2.5)
+	if pre, _ := other["pre_consumed"].(float64); pre <= 0 {
+		t.Errorf("日志 pre_consumed = %#v，期望 > 0（预扣快照应被记录）", other["pre_consumed"])
+	}
+}
+
+// 没有可用渠道时也要退款，并且错误日志要带上真实原因，
+// 不能只写一句泛泛的「请求失败」。
+func TestRelayRefundLogsNoChannelReason(t *testing.T) {
+	base := newRelayServer(t)
+	user, tok := seedBillingUserToken(t, 1_000_000, 1_000_000, false)
+	// 故意不建渠道。
+
+	resp := postChatWithKey(t, base, tok.Key, `{"model":"gpt-4o","messages":[]}`)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 = %d，期望 503；body=%s", resp.StatusCode, body)
+	}
+
+	if got := loadUser(t, user.ID); got.Quota != 1_000_000 {
+		t.Errorf("无渠道时预扣应全额退还，用户余额 = %d", got.Quota)
+	}
+	errLogs := logsOfType(t, constant.LogTypeError)
+	if len(errLogs) != 1 {
+		t.Fatalf("错误日志数 = %d，期望 1 条", len(errLogs))
+	}
+	if !strings.Contains(errLogs[0].Content, "没有可用渠道") {
+		t.Errorf("错误日志应包含「没有可用渠道」，实际 %q", errLogs[0].Content)
+	}
+	assertOtherBool(t, decodeOther(t, errLogs[0]), "refunded", true)
 }
 
 // 重试到第二个渠道成功：整次请求只结算一次，账本只减少一次。

@@ -9,6 +9,7 @@ package relay
 
 import (
 	"errors"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 
@@ -85,16 +86,23 @@ func SettleRequestBilling(c *gin.Context, s *service.BillingSession, info *relay
 	usage := info.Attempt.Usage
 	if usage == nil || !usage.Valid() {
 		if _, err := s.Refund(); err != nil {
+			// 退款暂时失败：会话仍是 preConsumed，defer 会重试。
+			// 这里不写审计日志——否则 defer 退款成功后还会再写一条，
+			// 同一次请求出现两条互相矛盾的「已退款」记录。
+			// 把原因放进 LastError，让 defer 写出的那条日志带上上下文。
 			logger.Error("退还预扣额度失败",
 				"request_id", info.Request.RequestID,
 				"user_id", info.Request.UserID,
 				"token_id", info.Request.TokenID,
 				"error", err)
+			info.Request.LastError = types.NewUpstreamError(
+				http.StatusBadGateway, "上游未返回 usage，退款失败")
+			return
 		}
 
 		const reason = "上游未返回 usage，已退还预扣"
 		if err := model.WriteLog(service.BuildBillingErrorLog(
-			info, reason, billingDetail(info), c.ClientIP())); err != nil {
+			info, reason, billingDetail(info), true, c.ClientIP())); err != nil {
 			logger.Error("写入计费错误日志失败",
 				"request_id", info.Request.RequestID,
 				"error", err)
@@ -108,8 +116,11 @@ func SettleRequestBilling(c *gin.Context, s *service.BillingSession, info *relay
 		return
 	}
 
+	// ★ 用请求开始时冻结的倍率结算，而不是再读一次配置：
+	// 请求飞行途中配置可能被热更新，用新倍率结算会让金额与日志里
+	// 记录的预扣依据（同一组倍率）对不上，历史账目无法复盘。
 	quota, detail := service.CalculateTextQuota(
-		info.Request.OriginModelName, usage.PromptTokens, usage.CompletionTokens, info.Request.Group)
+		usage.PromptTokens, usage.CompletionTokens, billingPricing(info))
 	// 日志里的 pre_consumed 必须来自状态机的实际预扣，而不是重新估算：
 	// 两者在免费模型/取整边界上可能不同。
 	detail.PreConsumedQuota = s.PreConsumed()
@@ -154,11 +165,23 @@ func RefundFailedRequestBilling(c *gin.Context, s *service.BillingSession, info 
 
 	refunded, err := s.Refund()
 	if err != nil {
+		// 退款失败意味着预扣仍冻结在账上，这是需要人工对账的状态，
+		// 必须留下一条明确写着 refunded=false 的审计记录。
 		logger.Error("退还预扣额度失败",
 			"request_id", info.Request.RequestID,
 			"user_id", info.Request.UserID,
 			"token_id", info.Request.TokenID,
 			"error", err)
+		reason := "退款失败，预扣仍冻结：" + err.Error()
+		if info.Request.LastError != nil {
+			reason += "；最后错误：" + info.Request.LastError.Message
+		}
+		if writeErr := model.WriteLog(service.BuildBillingErrorLog(
+			info, reason, billingDetail(info), false, c.ClientIP())); writeErr != nil {
+			logger.Error("写入计费错误日志失败",
+				"request_id", info.Request.RequestID,
+				"error", writeErr)
+		}
 		return
 	}
 	if !refunded {
@@ -171,7 +194,7 @@ func RefundFailedRequestBilling(c *gin.Context, s *service.BillingSession, info 
 		reason += "：" + info.Request.LastError.Message
 	}
 	if err := model.WriteLog(service.BuildBillingErrorLog(
-		info, reason, billingDetail(info), c.ClientIP())); err != nil {
+		info, reason, billingDetail(info), true, c.ClientIP())); err != nil {
 		logger.Error("写入计费错误日志失败",
 			"request_id", info.Request.RequestID,
 			"error", err)
@@ -183,6 +206,24 @@ func RefundFailedRequestBilling(c *gin.Context, s *service.BillingSession, info 
 		"channel_id", info.Attempt.ChannelID,
 		"model", info.Request.OriginModelName,
 		"pre_consumed", s.PreConsumed())
+}
+
+// billingPricing 取请求开始时冻结的倍率快照。
+//
+// 正常路径上 PrepareRequestBilling 一定先执行并填好 Billing；
+// EstimatedPromptTokens 为 0 只可能出现在直接调用 SettleRequestBilling
+// 的测试/内部路径，此时退回当前配置，保持行为可用。
+func billingPricing(info *relaycommon.RelayInfo) service.TextPricing {
+	b := info.Request.Billing
+	if b.EstimatedPromptTokens == 0 {
+		return service.ResolveTextPricing(info.Request.OriginModelName, info.Request.Group)
+	}
+	return service.TextPricing{
+		ModelRatio:           b.ModelRatio,
+		CompletionRatio:      b.CompletionRatio,
+		GroupRatio:           b.GroupRatio,
+		PreConsumeMultiplier: b.PreConsumeMultiplier,
+	}
 }
 
 // billingDetail 从请求级快照构造错误日志的计价上下文。

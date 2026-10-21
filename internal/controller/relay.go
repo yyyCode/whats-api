@@ -83,6 +83,13 @@ func Relay(c *gin.Context) {
 		ch, selectErr := service.SelectChannel(info.Request.Group, info.Request.OriginModelName, tried)
 		if selectErr != nil {
 			lastErr = selectErr
+			// 也要记进 LastError：兜底退款的错误日志靠它区分
+			// 「没有可用渠道」和「上游执行失败」。但如果前面已有失败的
+			// 尝试，保留那个更具体的上游错误——重试时渠道被自动禁用后
+			// 选不到渠道是它的后果，不是根因。
+			if info.Request.LastError == nil {
+				info.Request.LastError = lastErr
+			}
 			break
 		}
 		tried[ch.ID] = true
@@ -101,6 +108,7 @@ func Relay(c *gin.Context) {
 		adaptor := relay.GetAdaptor(ch.Type)
 		if adaptor == nil {
 			lastErr = types.NewInternalError(fmt.Sprintf("渠道类型 %d 尚未支持", ch.Type))
+			info.Request.LastError = lastErr
 			logger.Error("渠道类型没有适配器", "channel_id", ch.ID, "channel_type", ch.Type)
 			break
 		}

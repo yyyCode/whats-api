@@ -356,10 +356,11 @@ func TestBillingUnlimitedToken(t *testing.T) {
 	if u.UsedQuota != 200 {
 		t.Errorf("结算后用户 used_quota = %d，期望 200", u.UsedQuota)
 	}
-	// model.SettleQuota 对无限令牌整体跳过令牌侧更新，因此 used_quota 也不累加。
+	// 无限令牌不动 remain_quota，但 used_quota 仍要累加：
+	// 否则每把无限 key 的消费报表永远是 0，按 key 观察用量就失效了。
 	tok := readBillingToken(t, tokenID)
-	if tok.RemainQuota != 500 || tok.UsedQuota != 0 {
-		t.Errorf("无限令牌账本不该变化：remain=%d used=%d，期望 500/0", tok.RemainQuota, tok.UsedQuota)
+	if tok.RemainQuota != 500 || tok.UsedQuota != 200 {
+		t.Errorf("无限令牌账本 = (remain %d, used %d)，期望 500/200", tok.RemainQuota, tok.UsedQuota)
 	}
 }
 

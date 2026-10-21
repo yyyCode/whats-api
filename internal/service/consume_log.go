@@ -35,12 +35,13 @@ func BuildConsumeLog(info *relaycommon.RelayInfo, usage *types.Usage, quota int,
 
 // BuildBillingErrorLog 构造一条计费错误日志（上游无 usage、重试全部失败等）。
 //
-// 这类请求不产生消费：Quota 恒为 0，并且 other 里明确记 refunded=true，
-// 让对账时能区分「退了预扣」与「本来就没扣」。usage_source 固定为 missing，
-// 因为当前唯一的计费错误来源就是拿不到可用 usage。
-func BuildBillingErrorLog(info *relaycommon.RelayInfo, reason string, detail QuotaDetail, ip string) *model.Log {
+// 这类请求不产生消费：Quota 恒为 0。refunded 由调用方按退款的实际结果传入：
+// 写死为 true 会在退款失败时留下一条虚假的「已退款」审计记录，
+// 让对账人员误以为余额已经恢复。usage_source 固定为 missing，
+// 因为当前计费错误都意味着拿不到可用的 usage。
+func BuildBillingErrorLog(info *relaycommon.RelayInfo, reason string, detail QuotaDetail, refunded bool, ip string) *model.Log {
 	l := newBillingLog(info, detail, ip, "missing", map[string]any{
-		"refunded": true,
+		"refunded": refunded,
 		"reason":   reason,
 	})
 	l.Type = constant.LogTypeError

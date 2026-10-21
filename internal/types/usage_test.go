@@ -13,6 +13,9 @@ func TestUsageValid(t *testing.T) {
 		{"只有 prompt", &Usage{PromptTokens: 7}, true},
 		{"只有 completion", &Usage{CompletionTokens: 3}, true},
 		{"prompt 与 completion 都有", &Usage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10}, true},
+		{"负数 prompt", &Usage{PromptTokens: -7, CompletionTokens: 3}, false},
+		{"负数 completion", &Usage{PromptTokens: 7, CompletionTokens: -3}, false},
+		{"负数 total", &Usage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: -10}, false},
 	}
 	for _, c := range cases {
 		if got := c.usage.Valid(); got != c.want {
@@ -50,6 +53,12 @@ func TestUsageMergeNonZero(t *testing.T) {
 			name: "合并 nil 不变",
 			base: Usage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30},
 			next: nil,
+			want: Usage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30},
+		},
+		{
+			name: "后到的负数不覆盖已有正数",
+			base: Usage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30},
+			next: &Usage{PromptTokens: -1, CompletionTokens: -2, TotalTokens: -3},
 			want: Usage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30},
 		},
 		{
