@@ -75,16 +75,32 @@ func newBillingLog(info *relaycommon.RelayInfo, detail QuotaDetail, ip, usageSou
 // 序列化失败只可能是出现不可序列化的值，此时返回一个固定标记而不是空串：
 // 空串会被误读为「这条日志没有上下文」，标记则明确表示上下文丢失。
 func marshalBillingOther(info *relaycommon.RelayInfo, detail QuotaDetail, usageSource string, extra map[string]any) string {
+	// 预扣阶段的估算 token 与冻结金额在选渠道之前就已确定，它们是「当时为什么
+	// 扣了这笔钱」的唯一证据，所以优先取请求级快照。detail 是结算时用真实 usage
+	// 重新算出的上下文，PromptTokens 是实际输入量而不是预扣估算值；错误日志的
+	// detail 甚至没有 usage，只能退回快照。0 表示快照缺失（例如仅构造日志的调用），
+	// 此时才回退到 detail，保持与既有日志格式兼容。
+	estimatedPromptTokens := detail.PromptTokens
+	preConsumedQuota := detail.PreConsumedQuota
+	if info != nil {
+		if info.Request.Billing.EstimatedPromptTokens != 0 {
+			estimatedPromptTokens = info.Request.Billing.EstimatedPromptTokens
+		}
+		if preConsumedQuota == 0 {
+			preConsumedQuota = info.Request.Billing.PreConsumedQuota
+		}
+	}
+
 	other := map[string]any{
 		"billing_mode":            "ratio",
 		"model_ratio":             detail.ModelRatio,
 		"completion_ratio":        detail.CompletionRatio,
 		"group_ratio":             detail.GroupRatio,
 		"pre_consume_multiplier":  detail.PreConsumeMultiplier,
-		"estimated_prompt_tokens": detail.PromptTokens,
+		"estimated_prompt_tokens": estimatedPromptTokens,
 		"prompt_tokens":           detail.PromptTokens,
 		"completion_tokens":       detail.CompletionTokens,
-		"pre_consumed":            detail.PreConsumedQuota,
+		"pre_consumed":            preConsumedQuota,
 		"actual":                  detail.ActualQuota,
 		"quota_saturation":        detail.QuotaClamp.String(),
 		"upstream_model":          fieldUpstreamModel(info),

@@ -1,3 +1,5 @@
+// Package controller 的转发主循环在选渠道之前挂载请求级计费：
+// 预扣成功才允许选路；成功后按真实 usage 结算；失败或无 usage 时退款并写错误日志。
 package controller
 
 import (
@@ -30,7 +32,8 @@ const (
 	maxRetryTimes = 2
 )
 
-// Relay 是转发主循环：解析 → 选渠道 → 转换 → 上游 → 响应；失败时换渠道重试。
+// Relay 是转发主循环：解析 → 预扣 → 选渠道 → 转换 → 上游 → 响应 → 结算/退款；
+// 失败时换渠道重试。计费状态跨重试共享，最终只会结算或退款一次。
 func Relay(c *gin.Context) {
 	auth := relaycommon.GetAuthInfo(c)
 	if auth == nil {
@@ -59,6 +62,17 @@ func Relay(c *gin.Context) {
 	}
 
 	info := relaycommon.GenRelayInfo(auth, &payload, middleware.GetRequestID(c), body)
+
+	// ★ 预扣必须在选渠道之前：额度不足的请求不应占用任何上游渠道，
+	// 否则并发请求可以拿同一份余额去上游消费，账本失去意义。
+	billing, billingErr := relay.PrepareRequestBilling(c, info)
+	if billingErr != nil {
+		billingErr.Write(c)
+		return
+	}
+	// 兜底退款：成功路径由 SettleRequestBilling 把状态机推进到 settled，
+	// 这里的 defer 就成了幂等 no-op；任何提前 return 都不会把预扣留在账上。
+	defer relay.RefundFailedRequestBilling(c, billing, info)
 
 	tried := make(map[int]bool, maxRetryTimes+1)
 	var lastErr *types.APIError
@@ -94,6 +108,9 @@ func Relay(c *gin.Context) {
 
 		lastErr = relayAttempt(c, info, adaptor)
 		if lastErr == nil {
+			// 先结算再 return：defer 里的退款会看到 settled 状态并变成 no-op，
+			// 从而保证一次请求只产生一笔账。
+			relay.SettleRequestBilling(c, billing, info)
 			return
 		}
 		info.Request.LastError = lastErr
