@@ -64,6 +64,10 @@ type RequestState struct {
 	Body            []byte
 	RetryIndex      int
 	LastError       *types.APIError
+	// StartTime 是请求开始的时刻，用于消费日志里的 UseTime（请求耗时）。
+	// 它必须留在 RequestState：重试会重置 AttemptState，但一次请求的耗时
+	// 应覆盖所有尝试，不能从最后一个渠道才开始计时。
+	StartTime time.Time
 }
 
 // ChannelMeta 描述"这一次尝试选中的渠道"。
@@ -115,6 +119,7 @@ func GenRelayInfo(auth *AuthInfo, payload *RequestPayload, requestID string, bod
 			OriginModelName: payload.Model,
 			IsStream:        payload.Stream,
 			Body:            body,
+			StartTime:       time.Now(),
 		},
 		Stream: StreamOptions{PingInterval: DefaultPingInterval},
 	}
