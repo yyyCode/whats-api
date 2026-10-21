@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/yyyCode/whats-api/internal/common"
 	"github.com/yyyCode/whats-api/internal/logger"
 	relaycommon "github.com/yyyCode/whats-api/internal/relay/common"
 	"github.com/yyyCode/whats-api/internal/types"
@@ -86,6 +87,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 			if ev.data == "[DONE]" {
 				sawDone = true
+			} else {
+				// 在 handler goroutine 里解析 usage，而不是在 scanSSE goroutine 里：
+				// stream 的生命周期归 handler 所有，早退（客户端断开、写失败）后
+				// 调用方会立即结算预扣；若扫描 goroutine 还在往 info.Attempt.Usage
+				// 写入，就会和结算读 usage 形成数据竞争。这里串行处理，天然无锁。
+				// 每一帧都要看：某些兼容网关把累积 usage 放在倒数第二帧；
+				// MergeNonZero 保证后到的零值不会抹掉已采集到的非零用量。
+				mergeStreamUsage(info, ev.data)
 			}
 			n, err := c.Writer.WriteString("data: " + ev.data + "\n\n")
 			info.AddResponseWritten(n)
@@ -98,6 +107,22 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			}
 		}
 	}
+}
+
+// mergeStreamUsage 尝试从一帧 SSE data 里解析 usage 并合并到本次尝试。
+// 大多数帧没有 usage 字段（只有 delta），解析失败是常态，直接忽略。
+func mergeStreamUsage(info *relaycommon.RelayInfo, data string) {
+	var event struct {
+		Usage *types.Usage `json:"usage"`
+	}
+	if err := common.Unmarshal([]byte(data), &event); err != nil || event.Usage == nil {
+		return
+	}
+	if info.Attempt.Usage == nil {
+		info.Attempt.Usage = event.Usage
+		return
+	}
+	info.Attempt.Usage.MergeNonZero(event.Usage)
 }
 
 func setEventStreamHeaders(c *gin.Context) {

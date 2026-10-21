@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	relaycommon "github.com/yyyCode/whats-api/internal/relay/common"
+	"github.com/yyyCode/whats-api/internal/types"
 )
 
 // scanBody 把一段 SSE 文本包成 *http.Response，供纯解析测试使用。
@@ -66,6 +67,78 @@ func TestStreamScannerErrorsWhenUpstreamEndsWithoutDone(t *testing.T) {
 	err := StreamScannerHandler(c, scanBody("data: {\"a\":1}\n\n"), info)
 	if err == nil {
 		t.Fatal("上游没发 [DONE] 就结束，必须报错（否则会把截断当成正常完成）")
+	}
+}
+
+// TestStreamScannerKeepsNonZeroUsageAcrossTrailingZeroFrame 钉住 MergeNonZero 的语义：
+// 某些网关会在真正带用量的 accumulate 帧之后，再补一帧全零 usage。
+func TestStreamScannerKeepsNonZeroUsageAcrossTrailingZeroFrame(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c := newGinContext(w)
+
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n" +
+		"data: [DONE]\n\n"
+
+	info := &relaycommon.RelayInfo{Stream: relaycommon.StreamOptions{PingInterval: time.Hour}}
+	if err := StreamScannerHandler(c, scanBody(body), info); err != nil {
+		t.Fatalf("转发失败: %v", err)
+	}
+
+	want := types.Usage{PromptTokens: 5, CompletionTokens: 1, TotalTokens: 6}
+	if info.Attempt.Usage == nil || *info.Attempt.Usage != want {
+		t.Errorf("零值帧不该抹掉已采集的 usage，得到 %+v，期望 %+v", info.Attempt.Usage, want)
+	}
+
+	out := w.Body.String()
+	for _, frame := range []string{
+		`"prompt_tokens":5`,
+		`"prompt_tokens":0`,
+		"data: [DONE]",
+	} {
+		if !strings.Contains(out, frame) {
+			t.Errorf("客户端应收到所有转发帧（缺少 %q）: %q", frame, out)
+		}
+	}
+}
+
+// TestStreamScannerMergesUsageFromLaterFrame 覆盖 usage 出现在普通内容帧之后的情况。
+func TestStreamScannerMergesUsageFromLaterFrame(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c := newGinContext(w)
+
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n" +
+		"data: [DONE]\n\n"
+
+	info := &relaycommon.RelayInfo{Stream: relaycommon.StreamOptions{PingInterval: time.Hour}}
+	if err := StreamScannerHandler(c, scanBody(body), info); err != nil {
+		t.Fatalf("转发失败: %v", err)
+	}
+
+	want := types.Usage{PromptTokens: 3, CompletionTokens: 4, TotalTokens: 7}
+	if info.Attempt.Usage == nil || *info.Attempt.Usage != want {
+		t.Errorf("后到的 usage 帧没有被采集，得到 %+v，期望 %+v", info.Attempt.Usage, want)
+	}
+	if !strings.Contains(w.Body.String(), `"content":"hello"`) {
+		t.Errorf("普通内容帧必须照常转发: %q", w.Body.String())
+	}
+}
+
+// TestStreamScannerDoesNotParseDoneAsJSON 确认 [DONE] 不会被送进 JSON 解析。
+func TestStreamScannerDoesNotParseDoneAsJSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c := newGinContext(w)
+
+	info := &relaycommon.RelayInfo{Stream: relaycommon.StreamOptions{PingInterval: time.Hour}}
+	if err := StreamScannerHandler(c, scanBody("data: [DONE]\n\n"), info); err != nil {
+		t.Fatalf("[DONE] 应正常结束，实际: %v", err)
+	}
+	if info.Attempt.Usage != nil {
+		t.Errorf("[DONE] 不是 JSON，不该产生 usage，实际 %+v", info.Attempt.Usage)
 	}
 }
 
