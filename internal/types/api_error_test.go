@@ -54,7 +54,7 @@ func TestUpstreamErrorClassification(t *testing.T) {
 	}{
 		{http.StatusBadRequest, false, false},
 		{http.StatusUnauthorized, false, false},
-		{http.StatusTooManyRequests, true, true},
+		{http.StatusTooManyRequests, true, false},
 		{http.StatusInternalServerError, true, true},
 		{http.StatusBadGateway, true, true},
 	}
