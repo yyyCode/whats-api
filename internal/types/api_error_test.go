@@ -70,6 +70,13 @@ func TestUpstreamErrorClassification(t *testing.T) {
 	}
 }
 
+func TestNonErrorStatusIsNormalizedWithoutRetry(t *testing.T) {
+	e := NewUpstreamError(http.StatusFound, "重定向")
+	if e.StatusCode != http.StatusBadGateway || e.Retryable || e.ChannelError {
+		t.Errorf("3xx 应归一化为 502 且不重试/不禁用，实际 %+v", e)
+	}
+}
+
 func TestTransportErrorIsRetryableChannelError(t *testing.T) {
 	e := NewTransportError("连接被拒")
 	if !e.Retryable || !e.ChannelError {
