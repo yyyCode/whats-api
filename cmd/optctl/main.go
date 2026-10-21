@@ -163,7 +163,7 @@ func runUser(args []string, out io.Writer) error {
 
 func runToken(args []string, out io.Writer) error {
 	if len(args) < 3 || args[0] != "add" || args[1] == "" {
-		return fmt.Errorf("用法: optctl token add <key> <user-id>\n%s", usage)
+		return fmt.Errorf("用法: optctl token add <key> <user-id> [<remain-quota>]\n%s", usage)
 	}
 	userID, err := strconv.Atoi(args[2])
 	if err != nil {
@@ -174,19 +174,32 @@ func runToken(args []string, out io.Writer) error {
 		return fmt.Errorf("用户 %d 不存在: %w", userID, err)
 	}
 
+	// 缺省/负数=无限，零或正数=限额。
+	unlimited, remainQuota := true, int64(0)
+	if len(args) >= 4 {
+		n, err := strconv.ParseInt(args[3], 10, 64)
+		if err != nil {
+			return fmt.Errorf("remain-quota 必须是整数: %w", err)
+		}
+		if n >= 0 {
+			unlimited, remainQuota = false, n
+		}
+	}
+
 	tok := model.Token{
 		Key:            args[1],
 		UserID:         userID,
 		Status:         constant.TokenStatusEnabled,
 		ExpiredTime:    -1,
-		UnlimitedQuota: true, // M1 不计费；额度语义在 M2 落地
+		UnlimitedQuota: unlimited,
+		RemainQuota:    remainQuota,
 		GroupName:      user.GroupName,
 	}
 	if err := model.DB.Create(&tok).Error; err != nil {
 		return fmt.Errorf("创建令牌失败: %w", err)
 	}
-	fmt.Fprintf(out, "token id=%d key=%s user_id=%d group=%s unlimited=%v\n",
-		tok.ID, tok.Key, tok.UserID, tok.GroupName, tok.UnlimitedQuota)
+	fmt.Fprintf(out, "token id=%d key=%s user_id=%d group=%s remain_quota=%d unlimited=%v\n",
+		tok.ID, tok.Key, tok.UserID, tok.GroupName, tok.RemainQuota, tok.UnlimitedQuota)
 	return nil
 }
 
@@ -244,7 +257,7 @@ var usage = strings.TrimSpace(`
   optctl set  <key> <json-value>
   optctl list
   optctl user    add <username> [<group>] [<quota>]
-  optctl token   add <key> <user-id>
+  optctl token   add <key> <user-id> [<remain-quota>]  # 缺省/负数=无限，非负=限额
   optctl channel add <type> <key> <base-url> <models> [<group>] [<priority>] [<weight>]
 
 值必须是 JSON 编码，字符串要带引号：

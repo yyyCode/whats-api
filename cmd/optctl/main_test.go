@@ -162,3 +162,61 @@ func TestAddFixtures(t *testing.T) {
 		t.Error("不存在的 user-id 应报错")
 	}
 }
+
+func TestTokenQuotaArgument(t *testing.T) {
+	initOptctl(t)
+
+	var out bytes.Buffer
+	if err := run([]string{"user", "add", "bob"}, &out); err != nil {
+		t.Fatalf("user add: %v", err)
+	}
+
+	cases := []struct {
+		name        string
+		args        []string
+		unlimited   bool
+		remainQuota int64
+	}{
+		{"限额", []string{"token", "add", "sk-limited", "1", "500"}, false, 500},
+		{"零额度", []string{"token", "add", "sk-zero", "1", "0"}, false, 0},
+		{"负数视为无限", []string{"token", "add", "sk-neg", "1", "-1"}, true, 0},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out.Reset()
+			if err := run(c.args, &out); err != nil {
+				t.Fatalf("run(%v) 失败: %v", c.args, err)
+			}
+
+			key := c.args[2]
+			var tok model.Token
+			if err := model.DB.Where("key = ?", key).First(&tok).Error; err != nil {
+				t.Fatalf("查询令牌 %q 失败: %v", key, err)
+			}
+			if tok.UnlimitedQuota != c.unlimited || tok.RemainQuota != c.remainQuota {
+				t.Errorf("令牌 %q 额度字段不对: unlimited=%v remain_quota=%d，期望 unlimited=%v remain_quota=%d",
+					key, tok.UnlimitedQuota, tok.RemainQuota, c.unlimited, c.remainQuota)
+			}
+
+			if !strings.Contains(out.String(), "remain_quota=") || !strings.Contains(out.String(), "unlimited=") {
+				t.Errorf("输出应回显额度与无限标志: %q", out.String())
+			}
+		})
+	}
+
+	var before int64
+	if err := model.DB.Model(&model.Token{}).Count(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"token", "add", "sk-bad", "1", "abc"}, &out); err == nil {
+		t.Error("非整数 remain-quota 应报错")
+	}
+	var after int64
+	if err := model.DB.Model(&model.Token{}).Count(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Errorf("非法额度不该创建令牌，之前 %d 条，之后 %d 条", before, after)
+	}
+}
