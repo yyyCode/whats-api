@@ -23,11 +23,12 @@ func setWebRouter(engine *gin.Engine) {
 		case path == "/v1" || strings.HasPrefix(path, "/v1/"):
 			// 转发面的错误形状与 /api 不同：将来是 OpenAI/Claude 形状的 error 对象。
 			// M0 先给出同形状的明确 JSON，让客户端不必猜。
+			// 未注册的转发路径也要保持 OpenAI 错误形状，SDK 才能正确解析。
 			c.JSON(http.StatusNotFound, gin.H{
 				"error": gin.H{
-					"message": "转发端点尚未实现（计划在 M1）",
+					"message": "接口不存在",
 					"type":    "invalid_request_error",
-					"code":    "not_implemented",
+					"code":    "not_found",
 				},
 			})
 

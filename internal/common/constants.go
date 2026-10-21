@@ -7,7 +7,7 @@
 package common
 
 // Version 出现在启动日志、/api/status 与响应头 X-Whats-Api-Version。
-const Version = "v0.1.0-m0"
+const Version = "v0.2.0-m1"
 
 // CacheNamespacePrefix 是缓存键前缀，避免与同一个 Redis 实例上的其他系统撞键。
 const CacheNamespacePrefix = "whats-api"
