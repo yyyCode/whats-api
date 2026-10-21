@@ -109,8 +109,16 @@ func NewNoChannelError(modelName string) *APIError {
 //     把它当故障自动禁用会在流量高峰把渠道批量打掉，放大事故。
 //   - 其余 4xx 是请求本身的问题，重试只会放大故障。
 func NewUpstreamError(status int, message string) *APIError {
+	// 1xx/2xx/3xx 不是合法的上游错误：多半是 base_url 配错（例如 http 被重定向到 https）。
+	// 归一化为 502 给客户端，但不重试、不禁用——同一请求里换渠道不会让配置变对，
+	// 自动禁用只会把唯一可用的渠道也打掉。
 	if status < 400 || status > 599 {
-		status = http.StatusBadGateway
+		return &APIError{
+			StatusCode: http.StatusBadGateway,
+			Message:    message,
+			Type:       "upstream_error",
+			Code:       "upstream_error",
+		}
 	}
 	return &APIError{
 		StatusCode:   status,
