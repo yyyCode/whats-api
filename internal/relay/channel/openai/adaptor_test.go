@@ -1,7 +1,10 @@
 package openai
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,7 +12,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/yyyCode/whats-api/internal/common"
 	relaycommon "github.com/yyyCode/whats-api/internal/relay/common"
+	"github.com/yyyCode/whats-api/internal/types"
 )
 
 func TestConvertRequestPassesThroughWhenNotMapped(t *testing.T) {
@@ -74,6 +79,97 @@ func TestDoResponseClientGoneIsNotChannelError(t *testing.T) {
 	}
 	if apiErr.StatusCode != 0 || apiErr.ChannelError || apiErr.Retryable {
 		t.Errorf("客户端断开应返回不可重试、不归因渠道的 ClientGone，实际 %+v", apiErr)
+	}
+}
+
+// TestDoResponseCollectsUsageAndForwardsBody 验证非流式响应：
+// usage 被采集进 Attempt，同时写给客户端的字节与上游响应完全一致。
+func TestDoResponseCollectsUsageAndForwardsBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	body := []byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hi"}}],` +
+		`"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+
+	info := &relaycommon.RelayInfo{}
+	if _, apiErr := (&Adaptor{}).DoResponse(c, resp, info); apiErr != nil {
+		t.Fatalf("DoResponse 失败: %+v", apiErr)
+	}
+
+	want := &types.Usage{PromptTokens: 11, CompletionTokens: 7, TotalTokens: 18}
+	if info.Attempt.Usage == nil || *info.Attempt.Usage != *want {
+		t.Errorf("usage 采集错误，得到 %+v，期望 %+v", info.Attempt.Usage, want)
+	}
+	if !bytes.Equal(w.Body.Bytes(), body) {
+		t.Errorf("响应体必须原样转发，实际 %s", w.Body.String())
+	}
+}
+
+func TestConvertRequestStreamInjectsIncludeUsage(t *testing.T) {
+	body := []byte(`{"model":"gpt-4o","stream":true,"messages":[]}`)
+
+	got, err := (&Adaptor{}).ConvertRequest(nil, &relaycommon.RelayInfo{
+		Request: relaycommon.RequestState{IsStream: true},
+	}, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"include_usage":true`) {
+		t.Errorf("流式请求必须补 include_usage=true: %s", got)
+	}
+}
+
+func TestConvertRequestStreamMergesExistingStreamOptions(t *testing.T) {
+	body := []byte(`{"model":"gpt-4o","stream":true,` +
+		`"stream_options":{"include_usage":false,"foo":1}}`)
+
+	got, err := (&Adaptor{}).ConvertRequest(nil, &relaycommon.RelayInfo{
+		Request: relaycommon.RequestState{IsStream: true},
+	}, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload struct {
+		StreamOptions map[string]json.RawMessage `json:"stream_options"`
+	}
+	if err := common.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("结果不是合法 JSON: %v", err)
+	}
+	if string(payload.StreamOptions["include_usage"]) != "true" {
+		t.Errorf("include_usage 必须被改为 true: %s", got)
+	}
+	if string(payload.StreamOptions["foo"]) != "1" {
+		t.Errorf("stream_options 的其它键必须保留: %s", got)
+	}
+}
+
+func TestConvertRequestStreamReplacesNullStreamOptions(t *testing.T) {
+	body := []byte(`{"model":"gpt-4o","stream":true,"stream_options":null}`)
+
+	got, err := (&Adaptor{}).ConvertRequest(nil, &relaycommon.RelayInfo{
+		Request: relaycommon.RequestState{IsStream: true},
+	}, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload struct {
+		StreamOptions map[string]json.RawMessage `json:"stream_options"`
+	}
+	if err := common.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("结果不是合法 JSON: %v", err)
+	}
+	if len(payload.StreamOptions) != 1 ||
+		string(payload.StreamOptions["include_usage"]) != "true" {
+		t.Errorf("stream_options 为 null 时必须新建对象且只含 include_usage: %s", got)
 	}
 }
 

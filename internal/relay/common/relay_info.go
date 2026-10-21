@@ -85,6 +85,11 @@ type AttemptState struct {
 	ChannelMeta
 	ResponseWritten int64
 	UpstreamStatus  int
+	// Usage 是本次尝试从上游采集到的 token 用量。
+	// 它必须属于 AttemptState 而不是 RequestState：ResetAttempt 会整体换成一个新的
+	// AttemptState，这样重试到下一个渠道时不会把上一个渠道的 usage 带过来——
+	// 否则一次失败的尝试可能凭别人的用量被计费。
+	Usage *types.Usage
 }
 
 // StreamOptions 控制流式转发的时钟。做成字段而不是常量，

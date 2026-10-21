@@ -1,7 +1,7 @@
 // Package openai 是 OpenAI 兼容上游的适配器。
 //
-// M1 只做 Chat Completions：请求透传（只改 model）、响应透传（流式走 SSE）。
-// usage 解析在 M2 计费时补上——接口已经返回 any，不用改签名。
+// 只做 Chat Completions：请求透传（只在模型映射或流式补字段时改写）、
+// 响应透传（流式走 SSE），同时从响应里采集 usage 供计费使用。
 package openai
 
 import (
@@ -31,12 +31,12 @@ type Adaptor struct {
 
 func (a *Adaptor) Init(info *relaycommon.RelayInfo) { a.info = info }
 
-// ConvertRequest 透传请求体；只有模型映射命中时才重新序列化。
+// ConvertRequest 透传请求体；模型映射命中或流式请求需要补字段时才重新序列化。
 //
-// ★ 未映射时返回原字节：解析再序列化会改变字段顺序、丢未知字段的原始形状，
-// 对"透传"来说这些都不是我们该做的决定。
+// ★ 既不映射模型、也不是流式时返回原字节：解析再序列化会改变字段顺序、
+// 丢未知字段的原始形状，对"透传"来说这些都不是我们该做的决定。
 func (a *Adaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody []byte) ([]byte, error) {
-	if !info.Attempt.ModelMapped || info.Attempt.UpstreamModelName == "" {
+	if !info.Attempt.ModelMapped && !info.Request.IsStream {
 		return requestBody, nil
 	}
 
@@ -44,12 +44,51 @@ func (a *Adaptor) ConvertRequest(c *gin.Context, info *relaycommon.RelayInfo, re
 	if err := common.Unmarshal(requestBody, &payload); err != nil {
 		return nil, fmt.Errorf("请求体不是合法 JSON: %w", err)
 	}
-	modelBytes, err := common.Marshal(info.Attempt.UpstreamModelName)
-	if err != nil {
-		return nil, err
+
+	// 模型映射：只有真正命中映射时才改写 model，流式补字段不能顺手改模型名。
+	if info.Attempt.ModelMapped && info.Attempt.UpstreamModelName != "" {
+		modelBytes, err := common.Marshal(info.Attempt.UpstreamModelName)
+		if err != nil {
+			return nil, err
+		}
+		payload["model"] = modelBytes
 	}
-	payload["model"] = modelBytes
+
+	if info.Request.IsStream {
+		if err := mergeStreamOptions(payload); err != nil {
+			return nil, err
+		}
+	}
+
 	return common.Marshal(payload)
+}
+
+// mergeStreamOptions 向上游请求注入 stream_options.include_usage=true。
+//
+// ★ 这是对「请求纯透传」的有意偏离：没有 include_usage，OpenAI 兼容上游在流式
+// 响应里不会返回 usage，于是每个流式请求都会因缺少用量而退款，等于免费服务。
+// 代价是客户端会额外收到一帧 choices 为空、只带 usage 的最终帧（这是 OpenAI
+// 定义的标准行为，绝大多数客户端会忽略它）。
+//
+// 合并而不是覆盖：客户端显式设置的其它 stream_options 键（如
+// include_obfuscation）必须保留；只有流式字段的形状不合法（null、数组、
+// 字符串等）时才替换成一个干净的对象。
+func mergeStreamOptions(payload map[string]json.RawMessage) error {
+	options := map[string]json.RawMessage{}
+	if raw, ok := payload["stream_options"]; ok {
+		var existing map[string]json.RawMessage
+		// null 会解成 nil map，非对象会返回错误；两种情况都从空对象重新开始。
+		if err := common.Unmarshal(raw, &existing); err == nil && existing != nil {
+			options = existing
+		}
+	}
+	options["include_usage"] = json.RawMessage("true")
+	raw, err := common.Marshal(options)
+	if err != nil {
+		return err
+	}
+	payload["stream_options"] = raw
+	return nil
 }
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
@@ -96,7 +135,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		if apiErr := helper.StreamScannerHandler(c, resp, info); apiErr != nil {
 			return nil, apiErr
 		}
-		// M1 不解析流内 usage；M2 会在 SSE 转发的同时累加 usage。
+		// usage 已在 StreamScannerHandler 的事件循环里逐帧采集。
 		return nil, nil
 	}
 
@@ -110,6 +149,16 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		}
 		return nil, types.NewTransportError("读取上游响应失败: " + err.Error())
 	}
+
+	// 从响应体里采集 usage 作为计费依据。解析失败只说明这个上游没给标准 usage，
+	// 不能因此影响转发：响应仍然按原字节写给客户端，计费侧会走退款分支。
+	var usagePayload struct {
+		Usage *types.Usage `json:"usage"`
+	}
+	if err := common.Unmarshal(body, &usagePayload); err == nil && usagePayload.Usage != nil {
+		info.Attempt.Usage = usagePayload.Usage
+	}
+
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/json"
