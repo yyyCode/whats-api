@@ -9,14 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/yyyCode/whats-api/internal/common"
+	"github.com/yyyCode/whats-api/internal/relay/channel"
 	relaycommon "github.com/yyyCode/whats-api/internal/relay/common"
 	"github.com/yyyCode/whats-api/internal/relay/helper"
 	"github.com/yyyCode/whats-api/internal/types"
@@ -75,10 +74,9 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 	return nil
 }
 
-// DoRequest 暂时用本包的私有客户端；Task 5 会把共享出站传输统一到
-// internal/relay/channel 包，届时这里的实现替换为 channel.DoApiRequest(a, c, info, body)。
+// DoRequest 复用共享出站传输：超时策略与连接复用只在 channel 包维护一份。
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, body io.Reader) (*http.Response, error) {
-	return doAPIRequest(a, c, info, body)
+	return channel.DoApiRequest(a, c, info, body)
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (any, *types.APIError) {
@@ -116,42 +114,6 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 }
 
 func (a *Adaptor) GetChannelName() string { return "OpenAI" }
-
-// doAPIRequest 是临时的共享出站实现（Task 5 会搬到 channel 包）。
-//
-// ★ 不设 Client.Timeout：SSE 响应可能持续几分钟，总超时会把正常的流掐断。
-// 用 ResponseHeaderTimeout 卡住"上游一直不回响应头"，用拨号超时卡住"连不上"。
-var outboundClient = &http.Client{
-	Transport: &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
-		ForceAttemptHTTP2:     true,
-	},
-}
-
-func doAPIRequest(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo, body io.Reader) (*http.Response, error) {
-	url, err := a.GetRequestURL(info)
-	if err != nil {
-		return nil, err
-	}
-	// ★ 请求绑定 c.Request.Context()：客户端断开时，上游请求会被一起取消。
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, url, body)
-	if err != nil {
-		return nil, err
-	}
-	if err := a.SetupRequestHeader(c, &req.Header, info); err != nil {
-		return nil, err
-	}
-	return outboundClient.Do(req)
-}
 
 // upstreamErrorMessage 尽量从 OpenAI 错误体里取 message，取不到就截断原文。
 // 截断是为了让错误响应可读，也避免把一大段 HTML 原样转给客户端。
