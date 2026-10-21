@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"runtime/debug"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -35,6 +36,18 @@ func CustomRecovery() gin.HandlerFunc {
 
 			if c.Writer.Written() {
 				c.Abort()
+				return
+			}
+			// 转发面必须保持 OpenAI 错误形状：SDK 不会解析管理面信封。
+			// 两个面的错误契约从 M1 起就分开，recovery 也不能例外。
+			if path := c.Request.URL.Path; path == "/v1" || strings.HasPrefix(path, "/v1/") {
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+					"error": gin.H{
+						"message": "服务器内部错误",
+						"type":    "server_error",
+						"code":    "internal_error",
+					},
+				})
 				return
 			}
 			// /api 的信封（与 controller/response.go 的 APIResponse 同形）。

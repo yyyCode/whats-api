@@ -45,6 +45,13 @@ type Adaptor interface {
 // ★ 刻意不设 Client.Timeout：SSE 响应可能持续几分钟，总超时会把正常的流掐断。
 // 用 ResponseHeaderTimeout 卡住"上游一直不回响应头"，用拨号超时卡住"连不上"。
 var sharedClient = &http.Client{
+	// ★ 不跟随重定向：3xx 多半意味着 base_url 配错（或凭证/路径不对）。
+	// Go 默认会跟随，且对 POST 常常改成 GET、丢掉 body 与跨主机的 Authorization，
+	// 最终把登录页当成功响应透传给客户端。这里让 3xx 原样回到 DoResponse，
+	// 由 NewUpstreamError 统一归一化为 502（不重试、不禁用）。
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 	Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{

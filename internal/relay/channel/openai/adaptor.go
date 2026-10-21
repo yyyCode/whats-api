@@ -102,6 +102,12 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		// 客户端先断开时，上游连接会随 ctx 一起被关闭，ReadAll 返回
+		// context canceled / unexpected EOF。这不是渠道故障：
+		// 若当成 TransportError，重试循环会禁用一条完全健康的渠道。
+		if c.Request.Context().Err() != nil {
+			return nil, types.NewClientGone()
+		}
 		return nil, types.NewTransportError("读取上游响应失败: " + err.Error())
 	}
 	contentType := resp.Header.Get("Content-Type")

@@ -1,8 +1,13 @@
 package openai
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 
 	relaycommon "github.com/yyyCode/whats-api/internal/relay/common"
 )
@@ -41,6 +46,34 @@ func TestConvertRequestRewritesMappedModel(t *testing.T) {
 	}
 	if strings.Contains(string(got), "gpt-alias") {
 		t.Errorf("原始模型名不该残留: %s", got)
+	}
+}
+
+// failingBody 模拟"上游响应头已到、body 读到一半连接被取消"。
+type failingBody struct{}
+
+func (failingBody) Read([]byte) (int, error) { return 0, context.Canceled }
+func (failingBody) Close() error             { return nil }
+
+func TestDoResponseClientGoneIsNotChannelError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = req
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       failingBody{},
+	}
+	_, apiErr := (&Adaptor{}).DoResponse(c, resp, &relaycommon.RelayInfo{})
+	if apiErr == nil {
+		t.Fatal("读取 body 失败必须返回错误")
+	}
+	if apiErr.StatusCode != 0 || apiErr.ChannelError || apiErr.Retryable {
+		t.Errorf("客户端断开应返回不可重试、不归因渠道的 ClientGone，实际 %+v", apiErr)
 	}
 }
 
