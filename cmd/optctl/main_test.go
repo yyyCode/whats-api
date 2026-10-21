@@ -116,3 +116,49 @@ func TestGetUnknownKeyFails(t *testing.T) {
 		t.Error("读取未注册的 key 应该报错")
 	}
 }
+
+func TestAddFixtures(t *testing.T) {
+	initOptctl(t)
+
+	var out bytes.Buffer
+	if err := run([]string{"user", "add", "alice", "default", "1000000"}, &out); err != nil {
+		t.Fatalf("user add: %v", err)
+	}
+	if err := run([]string{"token", "add", "sk-local", "1"}, &out); err != nil {
+		t.Fatalf("token add: %v", err)
+	}
+	if err := run([]string{"channel", "add", "1", "sk-upstream", "http://127.0.0.1:8080", "gpt-4o,gpt-4o-mini"}, &out); err != nil {
+		t.Fatalf("channel add: %v", err)
+	}
+
+	var users []model.User
+	if err := model.DB.Find(&users).Error; err != nil || len(users) != 1 {
+		t.Fatalf("用户数 = %d err=%v", len(users), err)
+	}
+	if users[0].Username != "alice" || users[0].GroupName != "default" || users[0].Quota != 1000000 {
+		t.Errorf("用户字段不对: %+v", users[0])
+	}
+
+	var tokens []model.Token
+	if err := model.DB.Find(&tokens).Error; err != nil || len(tokens) != 1 {
+		t.Fatalf("令牌数 = %d err=%v", len(tokens), err)
+	}
+	if tokens[0].Key != "sk-local" || !tokens[0].UnlimitedQuota || tokens[0].ExpiredTime != -1 {
+		t.Errorf("令牌字段不对: %+v", tokens[0])
+	}
+
+	var channels []model.Channel
+	if err := model.DB.Find(&channels).Error; err != nil || len(channels) != 1 {
+		t.Fatalf("渠道数 = %d err=%v", len(channels), err)
+	}
+	if channels[0].Type != 1 || channels[0].Status != 1 || channels[0].GroupName != "default" {
+		t.Errorf("渠道字段不对: %+v", channels[0])
+	}
+
+	if err := run([]string{"channel", "add", "9", "k", "http://x", "m"}, &out); err == nil {
+		t.Error("未知渠道类型应报错")
+	}
+	if err := run([]string{"token", "add", "sk-x", "999"}, &out); err == nil {
+		t.Error("不存在的 user-id 应报错")
+	}
+}
