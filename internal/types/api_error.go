@@ -104,19 +104,21 @@ func NewNoChannelError(modelName string) *APIError {
 }
 
 // NewUpstreamError 保留上游状态码，并按状态码判定是否值得重试：
-// 5xx 与 429 归因于渠道；其余 4xx 是请求本身的问题，重试只会放大故障。
+//   - 429 与 5xx 可重试：可能有别的渠道能接住；
+//   - 只有 5xx 归因于渠道：429 是上游限流，换渠道即可，
+//     把它当故障自动禁用会在流量高峰把渠道批量打掉，放大事故。
+//   - 其余 4xx 是请求本身的问题，重试只会放大故障。
 func NewUpstreamError(status int, message string) *APIError {
 	if status < 400 || status > 599 {
 		status = http.StatusBadGateway
 	}
-	retryable := status == http.StatusTooManyRequests || status >= 500
 	return &APIError{
 		StatusCode:   status,
 		Message:      message,
 		Type:         "upstream_error",
 		Code:         "upstream_error",
-		Retryable:    retryable,
-		ChannelError: retryable,
+		Retryable:    status == http.StatusTooManyRequests || status >= 500,
+		ChannelError: status >= http.StatusInternalServerError,
 	}
 }
 
