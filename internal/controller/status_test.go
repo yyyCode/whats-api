@@ -135,12 +135,14 @@ func TestStatusShape(t *testing.T) {
 	}
 
 	cfg := data["config"].(map[string]any)
-	if cfg["registered_keys"].(float64) != 4 {
-		t.Errorf("registered_keys = %v，期望 4", cfg["registered_keys"])
+	// 静态断言：新增配置域会让这里失败，提醒作者确认 /api/status 的形状变化是有意的。
+	// M2 增加 ratio_setting（6 项）后：system_setting 4 项 + ratio_setting 6 项 = 10。
+	if cfg["registered_keys"].(float64) != 10 {
+		t.Errorf("registered_keys = %v，期望 10", cfg["registered_keys"])
 	}
 	modules := cfg["modules"].([]any)
-	if len(modules) != 1 || modules[0] != "system_setting" {
-		t.Errorf("modules = %v，期望 [system_setting]", modules)
+	if len(modules) != 2 || modules[0] != "ratio_setting" || modules[1] != "system_setting" {
+		t.Errorf("modules = %v，期望 [ratio_setting system_setting]", modules)
 	}
 }
 
